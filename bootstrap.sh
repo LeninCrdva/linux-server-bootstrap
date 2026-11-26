@@ -293,7 +293,7 @@ create_rootless_user() {
     if [[ -n $ROOTLESS_UID ]]; then
       local by_uid
       by_uid=$(getent passwd "$ROOTLESS_UID" | cut -d: -f1 || true)
-      [[ -z $by_uid ]] || die "UID $ROOTLESS_UID is already used by '$by_uid'"
+      [[ -z $by_uid ]] || die "UID $ROOTLESS_UID is already used by '$by_uid'. If that is the admin user of this same run, delete the conflicting account first (see README) or pick another UID."
     fi
     if [[ -n $ROOTLESS_GID ]]; then
       local by_gid
@@ -318,8 +318,16 @@ create_rootless_user() {
   fi
 }
 
-create_user "$ADMIN_USER"
-create_rootless_user
+# When a fixed UID/GID is requested for the rootless user, create it FIRST so it
+# can claim that ID; the admin user (auto-assigned UID) then takes the next free
+# one. Otherwise create the admin first, as before.
+if [[ -n $ROOTLESS_UID || -n $ROOTLESS_GID ]]; then
+  create_rootless_user
+  create_user "$ADMIN_USER"
+else
+  create_user "$ADMIN_USER"
+  create_rootless_user
+fi
 
 log 'Configuring sudo access for the administrator'
 install -d -m 0750 /etc/sudoers.d
