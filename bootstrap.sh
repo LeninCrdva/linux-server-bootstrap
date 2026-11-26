@@ -21,6 +21,11 @@ key_lines() {
   done < "$file"
 }
 
+# True if any of the given registries.conf files/dirs already searches docker.io.
+has_docker_search() {
+  grep -rqs '^[[:space:]]*unqualified-search-registries.*docker\.io' "$@" 2>/dev/null
+}
+
 usage() {
   cat <<'EOF'
 Usage: sudo ./bootstrap.sh [OPTIONS]
@@ -33,7 +38,13 @@ Options:
                            Match these to `user:` in your compose files,
                            e.g. --rootless-uid 1000 --rootless-gid 1000 for
                            `user: "1000:1000"`
-  --ssh-port PORT          TCP port opened for SSH in UFW     (default: 22)
+  --unprivileged-port-start N
+                           Set net.ipv4.ip_unprivileged_port_start=N (persisted)
+                           so the rootless user can bind low ports like 80/443
+                                                                  (default: 80)
+  --ssh-port PORT          Port sshd listens on AND UFW allows (default: 22)
+  --ufw-reset              Wipe existing UFW rules and re-apply only SSH
+                           (default: keep existing rules when UFW is active)
   --docker-compat          Enable the `docker compose` wrapper (default: off)
   --no-docker-compat       Disable the wrapper explicitly
   --install-packages       Install OS packages with apt       (default: on)
@@ -77,6 +88,8 @@ DEF_ADMIN_USER=admin
 DEF_ROOTLESS_USER=app
 DEF_ROOTLESS_UID=''
 DEF_ROOTLESS_GID=''
+DEF_UNPRIVILEGED_PORT_START=80
+DEF_UFW_RESET=false
 DEF_SSH_PORT=22
 DEF_ENABLE_DOCKER_COMPAT=false
 DEF_INSTALL_PACKAGES=true
@@ -87,6 +100,8 @@ CLI_ADMIN_USER=''
 CLI_ROOTLESS_USER=''
 CLI_ROOTLESS_UID=''
 CLI_ROOTLESS_GID=''
+CLI_UNPRIVILEGED_PORT_START=''
+CLI_UFW_RESET=''
 CLI_SSH_PORT=''
 CLI_ENABLE_DOCKER_COMPAT=''
 CLI_INSTALL_PACKAGES=''
@@ -108,6 +123,9 @@ while [[ $# -gt 0 ]]; do
     --rootless-uid=*)        CLI_ROOTLESS_UID=${1#*=}; shift ;;
     --rootless-gid)          need_value "$1" "${2:-}"; CLI_ROOTLESS_GID=${2:-}; shift 2 ;;
     --rootless-gid=*)        CLI_ROOTLESS_GID=${1#*=}; shift ;;
+    --unprivileged-port-start)    need_value "$1" "${2:-}"; CLI_UNPRIVILEGED_PORT_START=${2:-}; shift 2 ;;
+    --unprivileged-port-start=*)  CLI_UNPRIVILEGED_PORT_START=${1#*=}; shift ;;
+    --ufw-reset)             CLI_UFW_RESET=true; shift ;;
     --ssh-port)              need_value "$1" "${2:-}"; CLI_SSH_PORT=${2:-}; shift 2 ;;
     --ssh-port=*)            CLI_SSH_PORT=${1#*=}; shift ;;
     --docker-compat|--enable-docker-compat) CLI_ENABLE_DOCKER_COMPAT=true; shift ;;
@@ -127,7 +145,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- .env file ----------------------------------------------------------------
-KNOWN_VARS='ADMIN_USER ROOTLESS_USER ROOTLESS_UID ROOTLESS_GID SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
+KNOWN_VARS='ADMIN_USER ROOTLESS_USER ROOTLESS_UID ROOTLESS_GID UNPRIVILEGED_PORT_START UFW_RESET SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
 
 # Parses KEY=VALUE lines without eval: comments (#) and blank lines are skipped,
 # optional surrounding quotes are stripped, unknown keys are ignored.
@@ -184,6 +202,8 @@ ADMIN_USER=$(pick ADMIN_USER)
 ROOTLESS_USER=$(pick ROOTLESS_USER)
 ROOTLESS_UID=$(pick ROOTLESS_UID)
 ROOTLESS_GID=$(pick ROOTLESS_GID)
+UNPRIVILEGED_PORT_START=$(pick UNPRIVILEGED_PORT_START)
+UFW_RESET=$(pick UFW_RESET)
 SSH_PORT=$(pick SSH_PORT)
 ENABLE_DOCKER_COMPAT=$(pick ENABLE_DOCKER_COMPAT)
 INSTALL_PACKAGES=$(pick INSTALL_PACKAGES)
@@ -218,6 +238,11 @@ fi
 if [[ -n $ROOTLESS_GID ]]; then
   valid_id "$ROOTLESS_GID" || die "Invalid ROOTLESS_GID: $ROOTLESS_GID"
 fi
+valid_port_start() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 0 <= 10#$1 && 10#$1 <= 65535 ))
+}
+valid_port_start "$UNPRIVILEGED_PORT_START" || die "Invalid UNPRIVILEGED_PORT_START: $UNPRIVILEGED_PORT_START (0-65535)"
+valid_bool "$UFW_RESET" || die "UFW_RESET must be true or false (got: $UFW_RESET)"
 
 # The sudo (admin) key and the rootless key must never be the same: the admin
 # key grants sudo, so sharing it with the rootless/CI account would defeat the
@@ -235,6 +260,8 @@ if [[ $CLI_PRINT_CONFIG == true ]]; then
   printf 'ROOTLESS_USER=%s\n' "$ROOTLESS_USER"
   printf 'ROOTLESS_UID=%s\n' "$ROOTLESS_UID"
   printf 'ROOTLESS_GID=%s\n' "$ROOTLESS_GID"
+  printf 'UNPRIVILEGED_PORT_START=%s\n' "$UNPRIVILEGED_PORT_START"
+  printf 'UFW_RESET=%s\n' "$UFW_RESET"
   printf 'SSH_PORT=%s\n' "$SSH_PORT"
   printf 'ENABLE_DOCKER_COMPAT=%s\n' "$ENABLE_DOCKER_COMPAT"
   printf 'INSTALL_PACKAGES=%s\n' "$INSTALL_PACKAGES"
@@ -262,7 +289,8 @@ if [[ "$INSTALL_PACKAGES" == true ]]; then
 
   log 'Installing base packages'
   apt-get install -y --no-install-recommends \
-    ca-certificates curl openssh-server ufw sudo uidmap slirp4netns fuse-overlayfs
+    ca-certificates curl openssh-server ufw sudo uidmap slirp4netns fuse-overlayfs \
+    libpam-systemd dbus-user-session containers-common
 
   log 'Installing Podman'
   apt-get install -y --no-install-recommends podman
@@ -274,6 +302,20 @@ fi
 command -v ufw >/dev/null || die 'UFW is not installed'
 command -v podman >/dev/null || die 'Podman is not installed'
 command -v sshd >/dev/null || die 'openssh-server is not installed; install it or run with INSTALL_PACKAGES=true so SSH access can be enabled safely'
+# Without pam_systemd.so logind cannot open user sessions: user@UID fails with
+# "$XDG_RUNTIME_DIR is not set" and rootless Podman falls back to cgroupfs.
+[[ -e /usr/lib/security/pam_systemd.so ]] || warn 'libpam-systemd is missing (pam_systemd.so not found); user@UID will fail and rootless Podman will use cgroupfs. Install: apt-get install -y libpam-systemd dbus-user-session (or re-run with INSTALL_PACKAGES=true)'
+
+# Short image names (e.g. dunglas/frankenphp) need unqualified-search-registries;
+# with --no-install-recommends the default registries.conf may not define it.
+log 'Configuring container registries (short image names, system-wide)'
+if ! has_docker_search /etc/containers/registries.conf /etc/containers/registries.conf.d; then
+  install -d -m 0755 /etc/containers/registries.conf.d
+  printf 'unqualified-search-registries = ["docker.io"]\n' > /etc/containers/registries.conf.d/00-unqualified-search.conf
+  log 'Set unqualified-search-registries=["docker.io"] in /etc/containers/registries.conf.d/00-unqualified-search.conf'
+else
+  log 'docker.io already in system unqualified-search-registries'
+fi
 
 # --- Users --------------------------------------------------------------------
 log 'Creating users'
@@ -336,12 +378,13 @@ else
   create_rootless_user
 fi
 
-log 'Configuring sudo access for the administrator'
+log 'Configuring passwordless sudo for the administrator'
 install -d -m 0750 /etc/sudoers.d
 cat > "/etc/sudoers.d/90-${ADMIN_USER}" <<EOF
-${ADMIN_USER} ALL=(ALL:ALL) ALL
+${ADMIN_USER} ALL=(ALL:ALL) NOPASSWD: ALL
 EOF
 chmod 0440 "/etc/sudoers.d/90-${ADMIN_USER}"
+visudo -cf "/etc/sudoers.d/90-${ADMIN_USER}" >/dev/null || die 'The generated sudoers file is invalid'
 
 if id "$ROOTLESS_USER" | grep -q 'sudo\|wheel'; then
   warn "Rootless user $ROOTLESS_USER appears to belong to a privileged group"
@@ -359,10 +402,15 @@ else
   warn 'loginctl enable-linger failed (is systemd-logind running?); created the linger file directly — it applies on next boot or login'
 fi
 ROOTLESS_RUNTIME_DIR=/run/user/$(id -u "$ROOTLESS_USER")
+# Try to start the user manager right away (works when systemd-logind is running).
+systemctl start "user@$(id -u "$ROOTLESS_USER").service" 2>/dev/null || true
 if systemctl is-active --quiet "user@$(id -u "$ROOTLESS_USER")" 2>/dev/null; then
   log "User systemd manager for '$ROOTLESS_USER' is running"
 else
-  warn "User systemd manager for '$ROOTLESS_USER' is not running yet; it starts on next login/boot (linger is set). Podman will fall back to cgroupfs until then."
+  warn "User systemd manager for '$ROOTLESS_USER' is not running yet. Start it with: systemctl start user@$(id -u "$ROOTLESS_USER").service (or log in once as '$ROOTLESS_USER' / reboot; linger is already set). Podman will fall back to cgroupfs until then."
+  if [[ ! -e /usr/lib/security/pam_systemd.so ]]; then
+    warn "pam_systemd.so is missing: install libpam-systemd and dbus-user-session (apt-get install -y libpam-systemd dbus-user-session), then retry: systemctl start user@$(id -u "$ROOTLESS_USER").service"
+  fi
 fi
 
 # --- SSH access (gated by an existing key) -------------------------------------
@@ -426,6 +474,14 @@ if sshd -T 2>/dev/null | grep -Eqi '^pubkeyauthentication[[:space:]]+no'; then
   die 'sshd is configured with PubkeyAuthentication no; enable key authentication before running this script'
 fi
 
+# SSH_PORT configures BOTH sshd's listening port and the UFW rule, so the two
+# can never diverge (a custom port allowed in UFW while sshd still listens on
+# 22 would lock out remote access once UFW is enabled).
+log "Configuring sshd to listen on port $SSH_PORT"
+install -d -m 0755 /etc/ssh/sshd_config.d
+printf 'Port %s\n' "$SSH_PORT" > /etc/ssh/sshd_config.d/50-bootstrap-port.conf
+chmod 0644 /etc/ssh/sshd_config.d/50-bootstrap-port.conf
+
 log 'Enabling the SSH service'
 systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd || die 'Could not enable the SSH service'
 
@@ -472,19 +528,50 @@ systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn 's
 
 # --- Firewall -------------------------------------------------------------------
 log 'Configuring UFW'
-ufw --force reset >/dev/null
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow "${SSH_PORT}/tcp" comment 'SSH'
-ufw --force enable
+ufw_active=false
+ufw status 2>/dev/null | grep -q '^Status: active' && ufw_active=true
+existing_rules=0
+if $ufw_active; then
+  existing_rules=$(ufw status numbered 2>/dev/null | grep -c '^\[' || true)
+fi
+if $ufw_active && (( existing_rules > 0 )) && [[ $UFW_RESET != true ]]; then
+  warn "UFW is active with $existing_rules existing rule(s): keeping them and only ensuring SSH ${SSH_PORT}/tcp is allowed. Re-run with --ufw-reset to wipe all rules and re-apply only SSH."
+  ufw allow "${SSH_PORT}/tcp" comment 'SSH' 2>/dev/null || true
+else
+  ufw --force reset >/dev/null
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${SSH_PORT}/tcp" comment 'SSH'
+  ufw --force enable
+fi
 
 # --- Rootless Podman -------------------------------------------------------------
 log 'Configuring rootless Podman'
+log "Allowing the rootless user to bind ports >= $UNPRIVILEGED_PORT_START (net.ipv4.ip_unprivileged_port_start)"
+sysctl -w "net.ipv4.ip_unprivileged_port_start=$UNPRIVILEGED_PORT_START" >/dev/null
+printf 'net.ipv4.ip_unprivileged_port_start=%s\n' "$UNPRIVILEGED_PORT_START" > /etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf
+log "Persisted in /etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf (now: $(sysctl -n net.ipv4.ip_unprivileged_port_start))"
 if ! grep -q "^${ROOTLESS_USER}:" /etc/subuid 2>/dev/null; then
   usermod --add-subuids "100000-165535" "$ROOTLESS_USER"
 fi
 if ! grep -q "^${ROOTLESS_USER}:" /etc/subgid 2>/dev/null; then
   usermod --add-subgids "100000-165535" "$ROOTLESS_USER"
+fi
+
+# The per-user ~/.config/containers/registries.conf takes precedence over the
+# system one; if it exists without docker.io, short image names break for this
+# user. Ensure the rootless user also searches docker.io.
+log 'Ensuring docker.io search registry for the rootless user'
+user_registries_conf="$(user_home "$ROOTLESS_USER")/.config/containers/registries.conf"
+user_registries_d="$(user_home "$ROOTLESS_USER")/.config/containers/registries.conf.d"
+if ! has_docker_search "$user_registries_conf" "$user_registries_d"; then
+  install -d -m 0755 -o "$ROOTLESS_USER" -g "$ROOTLESS_USER" "$user_registries_d"
+  printf 'unqualified-search-registries = ["docker.io"]\n' > "$user_registries_d/00-unqualified-search.conf"
+  chown "$ROOTLESS_USER:$ROOTLESS_USER" "$user_registries_d/00-unqualified-search.conf"
+  chmod 0644 "$user_registries_d/00-unqualified-search.conf"
+  log "Added docker.io to unqualified-search-registries for '$ROOTLESS_USER' ($user_registries_d/00-unqualified-search.conf)"
+else
+  log "docker.io already in '$ROOTLESS_USER' unqualified-search-registries"
 fi
 
 if [[ "$ENABLE_DOCKER_COMPAT" == true ]]; then

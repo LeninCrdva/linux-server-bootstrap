@@ -7,10 +7,11 @@ bootstrap="$script_dir/../bootstrap.sh"
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 bash -n "$bootstrap"
-printf 'Shell syntax is valid.\n'
+bash -n "$script_dir/extras.sh"
+printf 'Shell syntax is valid (bootstrap.sh and extras.sh).\n'
 
 help_out=$(bash "$bootstrap" --help)
-for opt in --admin-user --rootless-user --rootless-uid --rootless-gid --ssh-port --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
+for opt in --admin-user --rootless-user --rootless-uid --rootless-gid --unprivileged-port-start --ssh-port --ufw-reset --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
   [[ $help_out == *"$opt"* ]] || fail "--help output is missing $opt"
 done
 printf -- '--help lists all expected options.\n'
@@ -95,5 +96,33 @@ if bash "$bootstrap" --print-config --rootless-uid 0 >/dev/null 2>&1; then
   fail 'ROOTLESS_UID=0 was accepted'
 fi
 printf 'Invalid rootless UID/GID values are rejected.\n'
+
+# unprivileged port start option resolves and validates
+out=$(bash "$bootstrap" --print-config --unprivileged-port-start 80)
+[[ $out == *'UNPRIVILEGED_PORT_START=80'* ]] || fail "UNPRIVILEGED_PORT_START not applied: $out"
+[[ $(bash "$bootstrap" --print-config) == *'UNPRIVILEGED_PORT_START=80'* ]] || fail 'default UNPRIVILEGED_PORT_START should be 80'
+if bash "$bootstrap" --print-config --unprivileged-port-start 99999 >/dev/null 2>&1; then
+  fail 'invalid UNPRIVILEGED_PORT_START was accepted'
+fi
+printf 'UNPRIVILEGED_PORT_START resolves, defaults to 80 and validates.\n'
+
+# UFW_RESET defaults to false (existing rules are kept unless explicitly reset)
+[[ $(bash "$bootstrap" --print-config) == *'UFW_RESET=false'* ]] || fail 'default UFW_RESET should be false'
+out=$(bash "$bootstrap" --print-config --ufw-reset)
+[[ $out == *'UFW_RESET=true'* ]] || fail '--ufw-reset not applied'
+if bash "$bootstrap" --print-config --ufw-reset=yes >/dev/null 2>&1; then
+  fail 'invalid UFW_RESET value was accepted'
+fi
+printf 'UFW_RESET defaults to false, is settable and validated.\n'
+
+# extras.sh: help and argument validation work without root changes
+extras_help=$(bash "$script_dir/extras.sh" --help)
+for opt in --unprivileged-port-start --docker-compat --registries --all; do
+  [[ $extras_help == *"$opt"* ]] || fail "extras.sh --help is missing $opt"
+done
+if bash "$script_dir/extras.sh" --bogus-option >/dev/null 2>&1; then
+  fail 'extras.sh accepted an unknown option'
+fi
+printf 'extras.sh --help lists its options and rejects unknown ones.\n'
 
 printf 'All tests passed.\n'
