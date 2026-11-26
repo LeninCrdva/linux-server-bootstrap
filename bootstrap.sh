@@ -491,6 +491,7 @@ if [[ "$ENABLE_DOCKER_COMPAT" == true ]]; then
   log 'Installing Docker CLI-compatible docker compose wrapper'
   cat > /usr/local/bin/docker <<'EOF'
 #!/usr/bin/env bash
+# created by linux-server-bootstrap: docker compose -> podman compose wrapper
 set -e
 if [[ "${1:-}" == "compose" ]]; then
   shift
@@ -505,6 +506,14 @@ EOF
   runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$ROOTLESS_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOTLESS_RUNTIME_DIR/bus" \
     systemctl --user enable --now podman.socket 2>/dev/null || \
     warn 'The Podman user socket could not be enabled from the installer session; enable it from a login session: systemctl --user enable --now podman.socket'
+else
+  # Re-run with the flag off: remove only the wrapper this script created.
+  if [[ -f /usr/local/bin/docker ]] && grep -q 'created by linux-server-bootstrap' /usr/local/bin/docker; then
+    rm -f /usr/local/bin/docker
+    log 'Removed the docker compose wrapper (ENABLE_DOCKER_COMPAT=false)'
+  fi
+  runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$ROOTLESS_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOTLESS_RUNTIME_DIR/bus" \
+    systemctl --user disable podman.socket 2>/dev/null || true
 fi
 
 log 'Verifying Podman'
