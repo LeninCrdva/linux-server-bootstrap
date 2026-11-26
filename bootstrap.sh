@@ -5,6 +5,22 @@ log() { printf '[+] %s\n' "$*" >&2; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 die() { printf '[x] %s\n' "$*" >&2; exit 1; }
 
+# A valid OpenSSH public key line, used to seed and to verify keys.
+SSH_KEY_RE='^[[:space:]]*(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/]+={0,3}([[:space:]].*)?$'
+
+# Prints the normalized, valid key lines contained in a .pub or authorized_keys file.
+key_lines() {
+  local file=$1 line
+  [[ -r $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    line=$(printf '%s' "$line" | tr -s '[:space:]' ' ')
+    if [[ $line =~ $SSH_KEY_RE ]]; then printf '%s\n' "$line"; fi
+  done < "$file"
+}
+
 usage() {
   cat <<'EOF'
 Usage: sudo ./bootstrap.sh [OPTIONS]
@@ -20,6 +36,11 @@ Options:
   --ssh-key-file PATH      Install SSH public key(s) for the admin user before
                            enabling SSH access (a .pub file or an existing
                            authorized_keys file, e.g. /root/.ssh/authorized_keys)
+  --rootless-ssh-key-file PATH
+                           Also allow SSH login for the rootless user with this
+                           key file (forwarding disabled). By default the rootless
+                           user is denied SSH login (DenyUsers). Must be a
+                           DIFFERENT key than --ssh-key-file (enforced)
   --env-file PATH          Load extra configuration from a .env-style file
                            (default: ./.env when present)
   --print-config           Print the resolved configuration and exit
@@ -40,7 +61,9 @@ Note: sudo strips exported variables, so prefer arguments or the
 Safety: SSH access and the firewall are enabled only when the admin user
 already has an SSH public key in ~/.ssh/authorized_keys (or one is supplied
 with --ssh-key-file). The script aborts otherwise to avoid locking out the
-server.
+server. The rootless (non-sudo) user is denied SSH login by default; use
+--rootless-ssh-key-file only if it genuinely needs remote access, and with a
+key different from the admin's (the script refuses shared keys).
 EOF
 }
 
@@ -51,6 +74,7 @@ DEF_SSH_PORT=22
 DEF_ENABLE_DOCKER_COMPAT=false
 DEF_INSTALL_PACKAGES=true
 DEF_SSH_KEY_FILE=''
+DEF_ROOTLESS_SSH_KEY_FILE=''
 
 CLI_ADMIN_USER=''
 CLI_ROOTLESS_USER=''
@@ -58,6 +82,7 @@ CLI_SSH_PORT=''
 CLI_ENABLE_DOCKER_COMPAT=''
 CLI_INSTALL_PACKAGES=''
 CLI_SSH_KEY_FILE=''
+CLI_ROOTLESS_SSH_KEY_FILE=''
 CLI_ENV_FILE=''
 CLI_PRINT_CONFIG=false
 
@@ -78,6 +103,8 @@ while [[ $# -gt 0 ]]; do
     --no-install-packages)   CLI_INSTALL_PACKAGES=false; shift ;;
     --ssh-key-file)          need_value "$1" "${2:-}"; CLI_SSH_KEY_FILE=${2:-}; shift 2 ;;
     --ssh-key-file=*)        CLI_SSH_KEY_FILE=${1#*=}; shift ;;
+    --rootless-ssh-key-file)          need_value "$1" "${2:-}"; CLI_ROOTLESS_SSH_KEY_FILE=${2:-}; shift 2 ;;
+    --rootless-ssh-key-file=*)        CLI_ROOTLESS_SSH_KEY_FILE=${1#*=}; shift ;;
     --env-file)              need_value "$1" "${2:-}"; CLI_ENV_FILE=${2:-}; shift 2 ;;
     --env-file=*)            CLI_ENV_FILE=${1#*=}; shift ;;
     --print-config)          CLI_PRINT_CONFIG=true; shift ;;
@@ -87,7 +114,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- .env file ----------------------------------------------------------------
-KNOWN_VARS='ADMIN_USER ROOTLESS_USER SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE'
+KNOWN_VARS='ADMIN_USER ROOTLESS_USER SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
 
 # Parses KEY=VALUE lines without eval: comments (#) and blank lines are skipped,
 # optional surrounding quotes are stripped, unknown keys are ignored.
@@ -146,6 +173,7 @@ SSH_PORT=$(pick SSH_PORT)
 ENABLE_DOCKER_COMPAT=$(pick ENABLE_DOCKER_COMPAT)
 INSTALL_PACKAGES=$(pick INSTALL_PACKAGES)
 SSH_KEY_FILE=$(pick SSH_KEY_FILE)
+ROOTLESS_SSH_KEY_FILE=$(pick ROOTLESS_SSH_KEY_FILE)
 
 # --- Validation ---------------------------------------------------------------
 valid_user() {
@@ -166,6 +194,17 @@ valid_port "$SSH_PORT" || die "Invalid SSH_PORT: $SSH_PORT"
 valid_bool "$ENABLE_DOCKER_COMPAT" || die "ENABLE_DOCKER_COMPAT must be true or false (got: $ENABLE_DOCKER_COMPAT)"
 valid_bool "$INSTALL_PACKAGES" || die "INSTALL_PACKAGES must be true or false (got: $INSTALL_PACKAGES)"
 
+# The sudo (admin) key and the rootless key must never be the same: the admin
+# key grants sudo, so sharing it with the rootless/CI account would defeat the
+# separation and let a leaked deploy key escalate to root.
+if [[ -n $SSH_KEY_FILE && -n $ROOTLESS_SSH_KEY_FILE ]]; then
+  shared=$(comm -12 <(key_lines "$SSH_KEY_FILE" | sort -u) <(key_lines "$ROOTLESS_SSH_KEY_FILE" | sort -u))
+  if [[ -n $shared ]]; then
+    desc=$(printf '%s\n' "$shared" | head -n1 | awk '{print $1, $3}')
+    die "The admin (sudo) key and the rootless key must be different, but '$desc' appears in both $SSH_KEY_FILE and $ROOTLESS_SSH_KEY_FILE. Generate a dedicated key (ssh-keygen -t ed25519 -f ~/.ssh/app_deploy -N '') and pass its .pub via --rootless-ssh-key-file."
+  fi
+fi
+
 if [[ $CLI_PRINT_CONFIG == true ]]; then
   printf 'ADMIN_USER=%s\n' "$ADMIN_USER"
   printf 'ROOTLESS_USER=%s\n' "$ROOTLESS_USER"
@@ -173,6 +212,7 @@ if [[ $CLI_PRINT_CONFIG == true ]]; then
   printf 'ENABLE_DOCKER_COMPAT=%s\n' "$ENABLE_DOCKER_COMPAT"
   printf 'INSTALL_PACKAGES=%s\n' "$INSTALL_PACKAGES"
   printf 'SSH_KEY_FILE=%s\n' "$SSH_KEY_FILE"
+  printf 'ROOTLESS_SSH_KEY_FILE=%s\n' "$ROOTLESS_SSH_KEY_FILE"
   printf 'ENV_FILE=%s\n' "${ENV_FILE:-<none>}"
   exit 0
 fi
@@ -239,9 +279,6 @@ touch "/var/lib/systemd/linger/$ROOTLESS_USER"
 chmod 0644 "/var/lib/systemd/linger/$ROOTLESS_USER"
 
 # --- SSH access (gated by an existing key) -------------------------------------
-# A valid OpenSSH public key line, used both to seed and to verify keys.
-SSH_KEY_RE='^[[:space:]]*(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)[[:space:]]+[A-Za-z0-9+/]+={0,3}([[:space:]].*)?$'
-
 user_home() { getent passwd "$1" | cut -d: -f6; }
 
 has_authorized_key() {
@@ -305,6 +342,47 @@ fi
 log 'Enabling the SSH service'
 systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd || die 'Could not enable the SSH service'
 
+# --- Rootless user SSH policy ---------------------------------------------------
+# Default: the rootless user is a service account, so it is explicitly denied
+# SSH login. With --rootless-ssh-key-file it gets a key instead, hardened with
+# forwarding disabled, so it can never be used as a pivot into the server.
+SSHD_DROPIN=/etc/ssh/sshd_config.d/60-bootstrap-rootless.conf
+ROOTLESS_SSH_DESC='denied (DenyUsers, default)'
+install -d -m 0755 /etc/ssh/sshd_config.d
+if [[ -n $ROOTLESS_SSH_KEY_FILE ]]; then
+  # Also refuse keys that are already authorized for the sudo user, even if
+  # they were installed manually (not via --ssh-key-file).
+  admin_keys="$(user_home "$ADMIN_USER")/.ssh/authorized_keys"
+  shared=$(comm -12 <(key_lines "$admin_keys" | sort -u) <(key_lines "$ROOTLESS_SSH_KEY_FILE" | sort -u))
+  if [[ -n $shared ]]; then
+    desc=$(printf '%s\n' "$shared" | head -n1 | awk '{print $1, $3}')
+    die "The rootless key '$desc' is also authorized for the sudo user '$ADMIN_USER'. Use a dedicated key for the rootless user."
+  fi
+  log "Installing SSH key(s) for the rootless user '$ROOTLESS_USER' from $ROOTLESS_SSH_KEY_FILE"
+  install_authorized_key "$ROOTLESS_USER" "$ROOTLESS_SSH_KEY_FILE"
+  has_authorized_key "$ROOTLESS_USER" || die "Failed to install an SSH key for '$ROOTLESS_USER'"
+  fix_ssh_perms "$ROOTLESS_USER"
+  cat > "$SSHD_DROPIN" <<EOF
+# Rootless service account with SSH access: no forwarding of any kind.
+Match User $ROOTLESS_USER
+    AllowTcpForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+EOF
+  ROOTLESS_SSH_DESC="key installed, forwarding disabled (Match User $ROOTLESS_USER)"
+  log "SSH login enabled for '$ROOTLESS_USER' with forwarding disabled"
+else
+  cat > "$SSHD_DROPIN" <<EOF
+# The rootless user is a service account: no SSH login.
+DenyUsers $ROOTLESS_USER
+EOF
+  log "SSH login denied for the rootless user '$ROOTLESS_USER' (default)"
+fi
+chmod 0644 "$SSHD_DROPIN"
+sshd -t || die 'The generated sshd configuration is invalid'
+systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || warn 'sshd could not be reloaded; the drop-in applies on next restart'
+
 # --- Firewall -------------------------------------------------------------------
 log 'Configuring UFW'
 ufw --force reset >/dev/null
@@ -346,5 +424,5 @@ runuser -u "$ROOTLESS_USER" -- podman info --format '{{.Host.Security.Rootless}}
   warn 'Rootless Podman verification requires a login session with a valid user runtime directory'
 
 log 'Configuration complete'
-printf '\nUsers:\n  sudo: %s\n  rootless: %s\n\nSSH: enabled, port %s/tcp, key required for %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
-  "$ADMIN_USER" "$ROOTLESS_USER" "$SSH_PORT" "$ADMIN_USER" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"
+printf '\nUsers:\n  sudo: %s\n  rootless: %s\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
+  "$ADMIN_USER" "$ROOTLESS_USER" "$SSH_PORT" "$ADMIN_USER" "$ROOTLESS_SSH_DESC" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"

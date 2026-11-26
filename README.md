@@ -85,6 +85,7 @@ Inspect the resolved configuration without changing anything:
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
 | `--ssh-key-file PATH` | `SSH_KEY_FILE` | _(empty)_ | Public key(s) installed for the admin user before SSH is enabled; accepts a `.pub` file or an existing `authorized_keys` file (e.g. `/root/.ssh/authorized_keys`) |
+| `--rootless-ssh-key-file PATH` | `ROOTLESS_SSH_KEY_FILE` | _(empty)_ | Also allow SSH login for the rootless user (key installed, forwarding disabled via a `Match User` block). By default the rootless user is denied SSH (`DenyUsers`). **Must be a different key than `--ssh-key-file` — the script refuses shared keys** |
 | `--env-file PATH` | — | `./.env` if present | Load extra values from a `.env`-style file |
 | `--print-config` | — | — | Print resolved values and exit |
 | `-h`, `--help` | — | — | Show usage |
@@ -109,6 +110,20 @@ sudo bash ./bootstrap.sh --ssh-key-file /root/.ssh/authorized_keys
 
 or add the key manually beforehand (`ssh-copy-id`, or write it to `~admin/.ssh/authorized_keys` with `0600` permissions and a `0700` `.ssh` directory). The private key always stays on your local machine; you log in with `ssh -i ~/.ssh/id_ed25519 admin@server`.
 
+### Rootless user and SSH
+
+SSH access only applies to the admin (sudo) user by default. The rootless user is a service account: it gets no key and is explicitly denied SSH login via `DenyUsers` in `/etc/ssh/sshd_config.d/60-bootstrap-rootless.conf`. That is the recommended posture — it cannot be used as a login or pivot even if someone later sets a password for it.
+
+If the rootless user genuinely needs remote access (e.g. CI deploys running `podman compose`), give it its **own** key, never the admin's. The script **enforces this**: it aborts if the admin (sudo) key and the rootless key share any key line, whether passed via flags or already present in the admin's `authorized_keys`. This matters because the admin key grants sudo — a leaked key shared with the CI/rootless account would escalate straight to root, while separate keys keep each one revocable and rotatable on its own:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/app_id_ed25519   # separate key pair on your machine
+scp ~/.ssh/app_id_ed25519.pub root@server:/tmp/
+sudo bash ./bootstrap.sh --rootless-ssh-key-file /tmp/app_id_ed25519.pub
+```
+
+In that case the script installs the key for the rootless user and replaces the `DenyUsers` line with a hardening block that disables all forwarding (`AllowTcpForwarding no`, `AllowAgentForwarding no`, `X11Forwarding no`, `PermitTunnel no`), so the account can run workloads but cannot tunnel into the server. It still has no sudo.
+
 ## Requirements
 
 - Debian or Ubuntu
@@ -130,6 +145,48 @@ docker compose up -d
 
 This does not install Docker. It creates a Podman compatibility wrapper for Compose commands and optionally exposes the Podman socket.
 
+## CI/CD (GitHub Actions)
+
+Use SSH **key** authentication for automation — never passwords. Put the private key in GitHub Secrets and install the public key for the rootless user:
+
+```bash
+# on your machine: dedicated deploy key (never reuse the admin key)
+ssh-keygen -t ed25519 -f ~/.ssh/app_deploy -N ''
+scp ~/.ssh/app_deploy.pub root@server:/tmp/
+
+# on the server
+sudo bash ./bootstrap.sh --ssh-key-file /root/.ssh/authorized_keys \
+  --rootless-ssh-key-file /tmp/app_deploy.pub
+```
+
+In GitHub: Settings → Secrets and variables → Actions → add `DEPLOY_HOST`, `DEPLOY_USER` (`app`) and `DEPLOY_SSH_KEY` (the contents of `~/.ssh/app_deploy`).
+
+```yaml
+name: deploy
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+      - name: Restart services as the rootless user
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new \
+            ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'cd /srv/app && podman compose pull && podman compose up -d'
+```
+
+(Any SSH action works the same way, e.g. `appleboy/ssh-action` with `host`/`username`/`key`.)
+
+Caveats:
+
+- The rootless account has forwarding disabled by the `Match User` block, so `ssh -L/-D` tunnels will **not** work. If the workflow must reach a service port, allow it in UFW or use a reverse proxy — do not rely on SSH port forwarding.
+- The rootless user has no sudo: CI can only run rootless Podman commands, which is exactly the intended blast radius.
+- Use `StrictHostKeyChecking=accept-new` (or pre-seed `known_hosts` with `ssh-keyscan`) so the workflow never blocks on an interactive prompt.
+- Rotate by generating a new key pair, updating `DEPLOY_SSH_KEY`, and re-running the bootstrap with the new `--rootless-ssh-key-file`.
+
 ## Security notes
 
 - Keep a second SSH session open after running the script.
@@ -149,6 +206,9 @@ This does not install Docker. It creates a Podman compatibility wrapper for Comp
 | `[x] Aborting before enabling SSH/UFW ... Add a key first` | The admin user has no key in `~/.ssh/authorized_keys` | Re-run with `--ssh-key-file ~/.ssh/id_ed25519.pub` (or `--ssh-key-file /root/.ssh/authorized_keys` to reuse root's key), or add the key manually first. This validator is intentional — it prevents lockouts |
 | Can I reuse the SSH key root already has? | Yes. The public key is meant to be shared | `sudo bash ./bootstrap.sh --ssh-key-file /root/.ssh/authorized_keys`, or manually: `install -d -m 0700 -o admin -g admin ~admin/.ssh && cp /root/.ssh/authorized_keys ~admin/.ssh/authorized_keys && chown admin:admin ~admin/.ssh/authorized_keys && chmod 0600 ~admin/.ssh/authorized_keys` |
 | How do I create a new SSH key? | You need a key pair on your local machine | On your local machine: `ssh-keygen -t ed25519`, then `scp ~/.ssh/id_ed25519.pub root@server:/tmp/` and re-run with `--ssh-key-file /tmp/id_ed25519.pub`. The `.pub` file is public and safe to copy; the private key never leaves your machine |
+| Can the rootless user log in over SSH? | No by default — it is a service account (`DenyUsers`) | Only if you pass `--rootless-ssh-key-file`, and then with its own key and forwarding disabled (`Match User` hardening) |
+| Can I use the same key for the admin and the rootless user? | No — the script aborts if both share any key line | The admin key grants sudo, so a shared key would let a leaked deploy/CI key escalate to root. Generate a dedicated pair: `ssh-keygen -t ed25519 -f ~/.ssh/app_deploy -N ''` and pass its `.pub` via `--rootless-ssh-key-file` |
+| Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
 | Environment variables seem ignored | `sudo` strips exported variables (`env_reset`) | Use the `sudo VAR=value bash ./bootstrap.sh` form, or pass CLI arguments |
