@@ -10,7 +10,7 @@ bash -n "$bootstrap"
 printf 'Shell syntax is valid.\n'
 
 help_out=$(bash "$bootstrap" --help)
-for opt in --admin-user --rootless-user --ssh-port --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
+for opt in --admin-user --rootless-user --rootless-uid --rootless-gid --ssh-port --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
   [[ $help_out == *"$opt"* ]] || fail "--help output is missing $opt"
 done
 printf -- '--help lists all expected options.\n'
@@ -83,5 +83,17 @@ printf 'Identical admin/rootless SSH keys are rejected.\n'
 out=$(bash "$bootstrap" --print-config --ssh-key-file "$key_a" --rootless-ssh-key-file "$key_b")
 [[ $out == *"ROOTLESS_SSH_KEY_FILE=$key_b"* ]] || fail "distinct rootless key not accepted: $out"
 printf 'Distinct admin/rootless SSH keys are accepted.\n'
+
+# rootless UID/GID options resolve and validate
+out=$(bash "$bootstrap" --print-config --rootless-uid 1000 --rootless-gid 1000)
+[[ $out == *'ROOTLESS_UID=1000'* && $out == *'ROOTLESS_GID=1000'* ]] || fail "rootless uid/gid not applied: $out"
+printf 'Rootless UID/GID options resolve correctly.\n'
+if bash "$bootstrap" --print-config --rootless-uid abc >/dev/null 2>&1; then
+  fail 'invalid ROOTLESS_UID was accepted'
+fi
+if bash "$bootstrap" --print-config --rootless-uid 0 >/dev/null 2>&1; then
+  fail 'ROOTLESS_UID=0 was accepted'
+fi
+printf 'Invalid rootless UID/GID values are rejected.\n'
 
 printf 'All tests passed.\n'

@@ -81,6 +81,8 @@ Inspect the resolved configuration without changing anything:
 |---|---|---|---|
 | `--admin-user NAME` | `ADMIN_USER` | `admin` | User with passwordless sudo |
 | `--rootless-user NAME` | `ROOTLESS_USER` | `app` | Rootless Podman user without sudo |
+| `--rootless-uid UID` | `ROOTLESS_UID` | _(auto)_ | UID for the rootless user — set it to match `user:` in your compose files (e.g. `user: "1000:1000"`) |
+| `--rootless-gid GID` | `ROOTLESS_GID` | _(auto)_ | Primary GID for the rootless user (usually the same as the UID) |
 | `--ssh-port PORT` | `SSH_PORT` | `22` | Port allowed through UFW and used by sshd |
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
@@ -145,6 +147,52 @@ docker compose up -d
 
 This does not install Docker. It creates a Podman compatibility wrapper for Compose commands and optionally exposes the Podman socket.
 
+## Choosing the rootless UID/GID (compose `user:`)
+
+If your compose files set `user: "1000:1000"`, the rootless user must have UID/GID 1000 on the host, otherwise container processes create files the host user cannot manage (permission errors). Pass them explicitly:
+
+```bash
+sudo bash ./bootstrap.sh --rootless-user app --rootless-uid 1000 --rootless-gid 1000 ...
+```
+
+Notes:
+
+- The script refuses to start if the requested UID/GID is already taken by another user/group.
+- UIDs/GIDs of an **existing** user are not modified in place — the script warns if they differ. To change them, delete the user and re-run (see below).
+- A UID below 1000 triggers a warning (normally reserved for system accounts).
+
+### Deleting the users created by the script
+
+Keep a root session open first — deleting the admin user removes your SSH way in. Then:
+
+```bash
+# 1. Stop the users' processes and rootless services
+sudo pkill -u blueskyad 2>/dev/null || true
+sudo pkill -u app 2>/dev/null || true
+sudo -u app systemctl --user stop podman.socket 2>/dev/null || true
+sudo loginctl disable-linger app
+
+# 2. Remove the files the script created
+sudo rm -f /var/lib/systemd/linger/app
+sudo rm -f /etc/sudoers.d/90-blueskyad
+sudo rm -f /etc/ssh/sshd_config.d/60-bootstrap-rootless.conf
+sudo rm -f /usr/local/bin/docker            # only if --docker-compat was used
+sudo systemctl reload ssh
+
+# 3. Delete the users (home, mail spool, subuid/subgid entries)
+sudo userdel --remove --force blueskyad
+sudo userdel --remove --force app
+sudo sed -i '/^blueskyad:/d; /^app:/d' /etc/subuid /etc/subgid   # safety net
+
+# 4. Verify
+id blueskyad 2>/dev/null || echo 'blueskyad gone'
+id app 2>/dev/null || echo 'app gone'
+ls /home
+grep -E '^(blueskyad|app):' /etc/subuid /etc/subgid || echo 'subuid/subgid clean'
+```
+
+Then re-run the bootstrap with the desired UID/GID. UFW is left untouched (it still allows SSH); the script resets and re-applies it on the next run anyway.
+
 ## CI/CD (GitHub Actions)
 
 Use SSH **key** authentication for automation — never passwords. Put the private key in GitHub Secrets and install the public key for the rootless user:
@@ -208,6 +256,9 @@ Caveats:
 | How do I create a new SSH key? | You need a key pair on your local machine | On your local machine: `ssh-keygen -t ed25519`, then `scp ~/.ssh/id_ed25519.pub root@server:/tmp/` and re-run with `--ssh-key-file /tmp/id_ed25519.pub`. The `.pub` file is public and safe to copy; the private key never leaves your machine |
 | Can the rootless user log in over SSH? | No by default — it is a service account (`DenyUsers`) | Only if you pass `--rootless-ssh-key-file`, and then with its own key and forwarding disabled (`Match User` hardening) |
 | Can I use the same key for the admin and the rootless user? | No — the script aborts if both share any key line | The admin key grants sudo, so a shared key would let a leaked deploy/CI key escalate to root. Generate a dedicated pair: `ssh-keygen -t ed25519 -f ~/.ssh/app_deploy -N ''` and pass its `.pub` via `--rootless-ssh-key-file` |
+| Compose says `user: "1000:1000"` but files end up owned by 1001 | The rootless user was auto-assigned UID 1001 | Recreate it with a fixed UID: delete the user (see *Deleting the users created by the script*) and re-run with `--rootless-uid 1000 --rootless-gid 1000` |
+| `[x] UID 1000 is already used by '...'` | Another account owns that UID | Pick a free UID (`getent passwd 1000`) or delete the conflicting account first |
+| User exists but with the wrong UID — the script only warns | UIDs of existing users are never changed in place | `userdel --remove --force <user>`, then re-run with `--rootless-uid` (full cleanup commands in the README) |
 | Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
