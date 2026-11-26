@@ -83,7 +83,9 @@ Inspect the resolved configuration without changing anything:
 | `--rootless-user NAME` | `ROOTLESS_USER` | `app` | Rootless Podman user without sudo |
 | `--rootless-uid UID` | `ROOTLESS_UID` | _(auto)_ | UID for the rootless user — set it to match `user:` in your compose files (e.g. `user: "1000:1000"`). When set, the rootless user is created **first** so it claims this UID; the admin user takes the next free one |
 | `--rootless-gid GID` | `ROOTLESS_GID` | _(auto)_ | Primary GID for the rootless user (usually the same as the UID). The group is created automatically with that GID |
-| `--ssh-port PORT` | `SSH_PORT` | `22` | Port allowed through UFW and used by sshd |
+| `--unprivileged-port-start N` | `UNPRIVILEGED_PORT_START` | `80` | Sets `net.ipv4.ip_unprivileged_port_start=N` (live + persisted in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf`) so the rootless user can publish ports 80/443 |
+| `--ssh-port PORT` | `SSH_PORT` | `22` | Port **sshd listens on** (via `/etc/ssh/sshd_config.d/50-bootstrap-port.conf`, validated with `sshd -t` before reloading) **and** allowed through UFW — the two can never diverge |
+| `--ufw-reset` | `UFW_RESET` | `false` | Wipe existing UFW rules and re-apply only SSH. By default, if UFW is already active with rules, they are **kept** and only the SSH rule is ensured |
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
 | `--ssh-key-file PATH` | `SSH_KEY_FILE` | _(empty)_ | Public key(s) installed for the admin user before SSH is enabled; accepts a `.pub` file or an existing `authorized_keys` file (e.g. `/root/.ssh/authorized_keys`) |
@@ -193,6 +195,26 @@ grep -E '^(blueskyad|app):' /etc/subuid /etc/subgid || echo 'subuid/subgid clean
 
 Then re-run the bootstrap with the desired UID/GID. UFW is left untouched (it still allows SSH); the script resets and re-applies it on the next run anyway.
 
+## Optional extras: `scripts/extras.sh`
+
+For special settings **without** re-running the whole bootstrap (UFW, users and SSH are left untouched; everything is idempotent):
+
+```bash
+sudo bash scripts/extras.sh --all                                   # everything below, port start 80
+sudo bash scripts/extras.sh --unprivileged-port-start 80            # rootless may bind ports >= 80
+sudo bash scripts/extras.sh --registries                            # docker.io search registries (system + user)
+sudo bash scripts/extras.sh --docker-compat --rootless-user bluesky # docker compose wrapper + podman socket
+```
+
+| Option | Effect |
+|---|---|
+| `--unprivileged-port-start N` | `sysctl -w net.ipv4.ip_unprivileged_port_start=N` + persists in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf` |
+| `--registries` | Writes `unqualified-search-registries = ["docker.io"]` to `/etc/containers/registries.conf.d/00-unqualified-search.conf` and `~<rootless>/.config/containers/registries.conf.d/00-unqualified-search.conf` if missing |
+| `--docker-compat` | Installs the `docker compose` → `podman compose` wrapper at `/usr/local/bin/docker`, enables linger and the rootless `podman.socket` |
+| `--all` | All of the above with port start 80 |
+
+The same settings are also available in the main script via `--unprivileged-port-start` and `--docker-compat`.
+
 ## CI/CD (GitHub Actions)
 
 Use SSH **key** authentication for automation — never passwords. Put the private key in GitHub Secrets and install the public key for the rootless user:
@@ -260,7 +282,14 @@ Caveats:
 | `[x] UID 1000 is already used by 'blueskyad'` | The admin user was created first and auto-took UID 1000 (or another pre-existing account owns it) | On a fresh run with `--rootless-uid`, the rootless user is created first and claims the UID. If the admin already exists with that UID, delete both users (see *Deleting the users created by the script*) and re-run, or choose a free UID (`getent passwd 1000`) |
 | User exists but with the wrong UID — the script only warns | UIDs of existing users are never changed in place | `userdel --remove --force <user>`, then re-run with `--rootless-uid` (full cleanup commands in the README) |
 | `useradd: group '1000' does not exist` | `-g 1000` needs the group to exist; it was removed with the old user | Fixed: the script now runs `groupadd -g <GID> <user>` before `useradd`. On an older run you can do it manually: `sudo groupadd -g 1000 bluesky` |
-| `WARN ... cgroupv2 manager is set to systemd but there is no systemd user session ... Falling back to --cgroup-manager=cgroupfs` | The rootless user has no systemd user manager (`user@UID.service`) running yet, so Podman cannot use the systemd cgroup manager | Benign — Podman falls back to cgroupfs and works. The script now runs `loginctl enable-linger <user>`, which starts the user manager immediately; if the warning persists, reboot or log in once as that user and check `systemctl status user@1000`. In containers without systemd as PID 1, set `cgroup_manager = "cgroupfs"` in `~/.config/containers/containers.conf` |
+| `WARN ... cgroupv2 manager is set to systemd but there is no systemd user session ... Falling back to --cgroup-manager=cgroupfs` | The rootless user has no systemd user manager (`user@UID.service`) running yet, so Podman cannot use the systemd cgroup manager | Benign — Podman falls back to cgroupfs and works. The script enables linger and tries `systemctl start user@<uid>`; if it still warns, run `sudo systemctl start user@1000` (or log in once as that user / reboot) and check `systemctl is-active user@1000`. In containers without systemd as PID 1 the user manager never starts — set `cgroup_manager = "cgroupfs"` in `~/.config/containers/containers.conf` |
+| `[!] User systemd manager for '...' is not running yet` (from the bootstrap) | Same cause, reported by the script right after enabling linger | Same fix: `sudo systemctl start user@1000` or first login/boot of the user. Safe to ignore — only Podman's cgroup backend is affected until then |
+| `user@1000.service` fails: `PAM unable to dlopen(pam_systemd.so)` / `$XDG_RUNTIME_DIR is not set` / `Error: 49 (Protocol driver not attached)` | `libpam-systemd` (and usually `dbus-user-session`) not installed — common in slim/container images. Without pam_systemd, logind cannot open the user session, so no `/run/user/1000` and the user manager exits 1 | `sudo apt-get install -y libpam-systemd dbus-user-session && sudo systemctl start user@1000` (the script now installs these packages itself). Verify: `systemctl is-active user@1000` → `active` |
+| `Error: short-name "dunglas/frankenphp:..." did not resolve to an alias and no unqualified-search registries are defined in "/etc/containers/registries.conf"` (build/run fails with exit 125) | Installed with `--no-install-recommends`, so `containers-common`'s default `unqualified-search-registries` is missing — and/or the user-level `~/.config/containers/registries.conf` exists without docker.io, which takes precedence over the system file | Fixed: the script installs `containers-common` and writes `unqualified-search-registries = ["docker.io"]` both to `/etc/containers/registries.conf.d/00-unqualified-search.conf` and to `~<rootless>/.config/containers/registries.conf.d/00-unqualified-search.conf`. Manually: `echo 'unqualified-search-registries = ["docker.io"]' > ~/.config/containers/registries.conf.d/00-unqualified-search.conf` (as the rootless user), or use fully-qualified image names (`docker.io/dunglas/frankenphp:...`). Verify: `podman info | grep -A3 registries` |
+| `Error: rootlessport cannot expose privileged port 80 ... bind: permission denied` | Rootless containers cannot bind ports < `net.ipv4.ip_unprivileged_port_start` (default 1024) | Fixed: the script sets it to 80 by default (`--unprivileged-port-start`, persisted in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf`). Manually: `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` + persist it, or publish on ports >= 1024, or use `sudo bash scripts/extras.sh --unprivileged-port-start 80` |
+| I ran with `--ssh-port 2222` but SSH still answers on 22 / I got locked out | `SSH_PORT` used to only open the UFW rule; sshd kept listening on 22 | Fixed: the script now writes `Port 2222` to `/etc/ssh/sshd_config.d/50-bootstrap-port.conf`, validates with `sshd -t` and reloads sshd **before** enabling UFW, so sshd and the firewall always use the same port. Verify: `ss -tlnp | grep sshd` |
+| `sudo` asks for a password (or fails) for the admin user | The sudoers rule used `ALL` instead of `NOPASSWD: ALL`, and `useradd` leaves the password locked so sudo could never authenticate | Fixed: the rule is now `<admin> ALL=(ALL:ALL) NOPASSWD: ALL` (validated with `visudo -cf`), matching the documented passwordless sudo |
+| Re-running the script wiped my UFW rules / blocked my services | The old script always ran `ufw --force reset` | Fixed: when UFW is already active with rules, they are kept and only the SSH rule is ensured; a full reset now requires `--ufw-reset` explicitly |
 | Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
