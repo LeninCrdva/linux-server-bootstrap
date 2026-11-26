@@ -348,9 +348,22 @@ if id "$ROOTLESS_USER" | grep -q 'sudo\|wheel'; then
 fi
 
 log 'Enabling linger for rootless Podman services'
-mkdir -p /var/lib/systemd/linger
-touch "/var/lib/systemd/linger/$ROOTLESS_USER"
-chmod 0644 "/var/lib/systemd/linger/$ROOTLESS_USER"
+# loginctl enable-linger also asks logind to start the user manager (user@UID)
+# right away; a plain linger file only takes effect on next login/boot.
+if loginctl enable-linger "$ROOTLESS_USER" 2>/dev/null; then
+  log "Linger enabled for '$ROOTLESS_USER' via loginctl"
+else
+  mkdir -p /var/lib/systemd/linger
+  touch "/var/lib/systemd/linger/$ROOTLESS_USER"
+  chmod 0644 "/var/lib/systemd/linger/$ROOTLESS_USER"
+  warn 'loginctl enable-linger failed (is systemd-logind running?); created the linger file directly — it applies on next boot or login'
+fi
+ROOTLESS_RUNTIME_DIR=/run/user/$(id -u "$ROOTLESS_USER")
+if systemctl is-active --quiet "user@$(id -u "$ROOTLESS_USER")" 2>/dev/null; then
+  log "User systemd manager for '$ROOTLESS_USER' is running"
+else
+  warn "User systemd manager for '$ROOTLESS_USER' is not running yet; it starts on next login/boot (linger is set). Podman will fall back to cgroupfs until then."
+fi
 
 # --- SSH access (gated by an existing key) -------------------------------------
 user_home() { getent passwd "$1" | cut -d: -f6; }
@@ -489,13 +502,15 @@ EOF
   chmod 0755 /usr/local/bin/docker
 
   log 'Enabling the rootless-compatible Podman API socket'
-  runuser -u "$ROOTLESS_USER" -- systemctl --user enable --now podman.socket 2>/dev/null || \
-    warn 'The Podman user socket could not be enabled from the installer session; the user should enable it from a login session'
+  runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$ROOTLESS_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOTLESS_RUNTIME_DIR/bus" \
+    systemctl --user enable --now podman.socket 2>/dev/null || \
+    warn 'The Podman user socket could not be enabled from the installer session; enable it from a login session: systemctl --user enable --now podman.socket'
 fi
 
 log 'Verifying Podman'
-runuser -u "$ROOTLESS_USER" -- podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || \
-  warn 'Rootless Podman verification requires a login session with a valid user runtime directory'
+runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$ROOTLESS_RUNTIME_DIR" DBUS_SESSION_BUS_ADDRESS="unix:path=$ROOTLESS_RUNTIME_DIR/bus" \
+  podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || \
+  warn "Rootless Podman could not be verified from the installer session (no user runtime at $ROOTLESS_RUNTIME_DIR yet). After the first login/boot of '$ROOTLESS_USER', check with: runuser -u $ROOTLESS_USER -- podman info"
 
 log 'Configuration complete'
 printf '\nUsers:\n  sudo: %s\n  rootless: %s (uid=%s, gid=%s)\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
