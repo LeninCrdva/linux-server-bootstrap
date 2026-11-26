@@ -229,8 +229,8 @@ case "${ID:-}" in
 esac
 
 # --- Packages -----------------------------------------------------------------
-log 'Updating package indexes'
 if [[ "$INSTALL_PACKAGES" == true ]]; then
+  log 'Updating package indexes'
   apt-get update
 
   log 'Installing base packages'
