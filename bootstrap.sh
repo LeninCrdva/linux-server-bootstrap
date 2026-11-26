@@ -28,6 +28,11 @@ Usage: sudo ./bootstrap.sh [OPTIONS]
 Options:
   --admin-user NAME        User with passwordless sudo        (default: admin)
   --rootless-user NAME     Rootless Podman user, no sudo      (default: app)
+  --rootless-uid UID       UID for the rootless user           (default: auto)
+  --rootless-gid GID       Primary GID for the rootless user  (default: auto)
+                           Match these to `user:` in your compose files,
+                           e.g. --rootless-uid 1000 --rootless-gid 1000 for
+                           `user: "1000:1000"`
   --ssh-port PORT          TCP port opened for SSH in UFW     (default: 22)
   --docker-compat          Enable the `docker compose` wrapper (default: off)
   --no-docker-compat       Disable the wrapper explicitly
@@ -70,6 +75,8 @@ EOF
 # --- Defaults ---------------------------------------------------------------
 DEF_ADMIN_USER=admin
 DEF_ROOTLESS_USER=app
+DEF_ROOTLESS_UID=''
+DEF_ROOTLESS_GID=''
 DEF_SSH_PORT=22
 DEF_ENABLE_DOCKER_COMPAT=false
 DEF_INSTALL_PACKAGES=true
@@ -78,6 +85,8 @@ DEF_ROOTLESS_SSH_KEY_FILE=''
 
 CLI_ADMIN_USER=''
 CLI_ROOTLESS_USER=''
+CLI_ROOTLESS_UID=''
+CLI_ROOTLESS_GID=''
 CLI_SSH_PORT=''
 CLI_ENABLE_DOCKER_COMPAT=''
 CLI_INSTALL_PACKAGES=''
@@ -95,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     --admin-user=*)          CLI_ADMIN_USER=${1#*=}; shift ;;
     --rootless-user)         need_value "$1" "${2:-}"; CLI_ROOTLESS_USER=${2:-}; shift 2 ;;
     --rootless-user=*)       CLI_ROOTLESS_USER=${1#*=}; shift ;;
+    --rootless-uid)          need_value "$1" "${2:-}"; CLI_ROOTLESS_UID=${2:-}; shift 2 ;;
+    --rootless-uid=*)        CLI_ROOTLESS_UID=${1#*=}; shift ;;
+    --rootless-gid)          need_value "$1" "${2:-}"; CLI_ROOTLESS_GID=${2:-}; shift 2 ;;
+    --rootless-gid=*)        CLI_ROOTLESS_GID=${1#*=}; shift ;;
     --ssh-port)              need_value "$1" "${2:-}"; CLI_SSH_PORT=${2:-}; shift 2 ;;
     --ssh-port=*)            CLI_SSH_PORT=${1#*=}; shift ;;
     --docker-compat|--enable-docker-compat) CLI_ENABLE_DOCKER_COMPAT=true; shift ;;
@@ -114,7 +127,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- .env file ----------------------------------------------------------------
-KNOWN_VARS='ADMIN_USER ROOTLESS_USER SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
+KNOWN_VARS='ADMIN_USER ROOTLESS_USER ROOTLESS_UID ROOTLESS_GID SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
 
 # Parses KEY=VALUE lines without eval: comments (#) and blank lines are skipped,
 # optional surrounding quotes are stripped, unknown keys are ignored.
@@ -169,6 +182,8 @@ pick() {
 
 ADMIN_USER=$(pick ADMIN_USER)
 ROOTLESS_USER=$(pick ROOTLESS_USER)
+ROOTLESS_UID=$(pick ROOTLESS_UID)
+ROOTLESS_GID=$(pick ROOTLESS_GID)
 SSH_PORT=$(pick SSH_PORT)
 ENABLE_DOCKER_COMPAT=$(pick ENABLE_DOCKER_COMPAT)
 INSTALL_PACKAGES=$(pick INSTALL_PACKAGES)
@@ -193,6 +208,16 @@ valid_user "$ROOTLESS_USER"
 valid_port "$SSH_PORT" || die "Invalid SSH_PORT: $SSH_PORT"
 valid_bool "$ENABLE_DOCKER_COMPAT" || die "ENABLE_DOCKER_COMPAT must be true or false (got: $ENABLE_DOCKER_COMPAT)"
 valid_bool "$INSTALL_PACKAGES" || die "INSTALL_PACKAGES must be true or false (got: $INSTALL_PACKAGES)"
+valid_id() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 2147483647 ))
+}
+if [[ -n $ROOTLESS_UID ]]; then
+  valid_id "$ROOTLESS_UID" || die "Invalid ROOTLESS_UID: $ROOTLESS_UID"
+  (( 10#$ROOTLESS_UID >= 1000 )) || warn 'ROOTLESS_UID below 1000 is normally reserved for system accounts'
+fi
+if [[ -n $ROOTLESS_GID ]]; then
+  valid_id "$ROOTLESS_GID" || die "Invalid ROOTLESS_GID: $ROOTLESS_GID"
+fi
 
 # The sudo (admin) key and the rootless key must never be the same: the admin
 # key grants sudo, so sharing it with the rootless/CI account would defeat the
@@ -208,6 +233,8 @@ fi
 if [[ $CLI_PRINT_CONFIG == true ]]; then
   printf 'ADMIN_USER=%s\n' "$ADMIN_USER"
   printf 'ROOTLESS_USER=%s\n' "$ROOTLESS_USER"
+  printf 'ROOTLESS_UID=%s\n' "$ROOTLESS_UID"
+  printf 'ROOTLESS_GID=%s\n' "$ROOTLESS_GID"
   printf 'SSH_PORT=%s\n' "$SSH_PORT"
   printf 'ENABLE_DOCKER_COMPAT=%s\n' "$ENABLE_DOCKER_COMPAT"
   printf 'INSTALL_PACKAGES=%s\n' "$INSTALL_PACKAGES"
@@ -259,8 +286,40 @@ create_user() {
   fi
 }
 
+create_rootless_user() {
+  if id "$ROOTLESS_USER" >/dev/null 2>&1; then
+    warn "User $ROOTLESS_USER already exists; leaving account settings unchanged"
+  else
+    if [[ -n $ROOTLESS_UID ]]; then
+      local by_uid
+      by_uid=$(getent passwd "$ROOTLESS_UID" | cut -d: -f1 || true)
+      [[ -z $by_uid ]] || die "UID $ROOTLESS_UID is already used by '$by_uid'"
+    fi
+    if [[ -n $ROOTLESS_GID ]]; then
+      local by_gid
+      by_gid=$(getent group "$ROOTLESS_GID" | cut -d: -f1 || true)
+      [[ -z $by_gid ]] || die "GID $ROOTLESS_GID is already used by group '$by_gid'"
+    fi
+    local args=()
+    if [[ -n $ROOTLESS_UID ]]; then args+=(-u "$ROOTLESS_UID"); fi
+    if [[ -n $ROOTLESS_GID ]]; then args+=(-g "$ROOTLESS_GID"); fi
+    useradd --create-home --shell /bin/bash ${args[@]+"${args[@]}"} "$ROOTLESS_USER"
+  fi
+  # UIDs/GIDs of an existing user are not changed in place; warn if they differ.
+  if [[ -n $ROOTLESS_UID ]]; then
+    local actual_uid
+    actual_uid=$(id -u "$ROOTLESS_USER")
+    [[ $actual_uid == "$ROOTLESS_UID" ]] || warn "User $ROOTLESS_USER has UID $actual_uid, not the requested $ROOTLESS_UID. To change it, delete and recreate the user (see README) and re-run this script."
+  fi
+  if [[ -n $ROOTLESS_GID ]]; then
+    local actual_gid
+    actual_gid=$(id -g "$ROOTLESS_USER")
+    [[ $actual_gid == "$ROOTLESS_GID" ]] || warn "User $ROOTLESS_USER has primary GID $actual_gid, not the requested $ROOTLESS_GID. To change it, delete and recreate the user (see README) and re-run this script."
+  fi
+}
+
 create_user "$ADMIN_USER"
-create_user "$ROOTLESS_USER"
+create_rootless_user
 
 log 'Configuring sudo access for the administrator'
 install -d -m 0750 /etc/sudoers.d
@@ -424,5 +483,5 @@ runuser -u "$ROOTLESS_USER" -- podman info --format '{{.Host.Security.Rootless}}
   warn 'Rootless Podman verification requires a login session with a valid user runtime directory'
 
 log 'Configuration complete'
-printf '\nUsers:\n  sudo: %s\n  rootless: %s\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
-  "$ADMIN_USER" "$ROOTLESS_USER" "$SSH_PORT" "$ADMIN_USER" "$ROOTLESS_SSH_DESC" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"
+printf '\nUsers:\n  sudo: %s\n  rootless: %s (uid=%s, gid=%s)\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
+  "$ADMIN_USER" "$ROOTLESS_USER" "$(id -u "$ROOTLESS_USER")" "$(id -g "$ROOTLESS_USER")" "$SSH_PORT" "$ADMIN_USER" "$ROOTLESS_SSH_DESC" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"
