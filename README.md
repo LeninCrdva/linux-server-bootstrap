@@ -84,7 +84,7 @@ Inspect the resolved configuration without changing anything:
 | `--ssh-port PORT` | `SSH_PORT` | `22` | Port allowed through UFW and used by sshd |
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
-| `--ssh-key-file PATH` | `SSH_KEY_FILE` | _(empty)_ | Public key installed for the admin user before SSH is enabled |
+| `--ssh-key-file PATH` | `SSH_KEY_FILE` | _(empty)_ | Public key(s) installed for the admin user before SSH is enabled; accepts a `.pub` file or an existing `authorized_keys` file (e.g. `/root/.ssh/authorized_keys`) |
 | `--env-file PATH` | — | `./.env` if present | Load extra values from a `.env`-style file |
 | `--print-config` | — | — | Print resolved values and exit |
 | `-h`, `--help` | — | — | Show usage |
@@ -98,10 +98,16 @@ The script installs and enables `openssh-server` and opens the SSH port in UFW *
 On a fresh server, pass your key explicitly:
 
 ```bash
-sudo ./bootstrap.sh --ssh-key-file ~/.ssh/id_ed25519.pub
+sudo bash ./bootstrap.sh --ssh-key-file ~/.ssh/id_ed25519.pub
 ```
 
-or add the key manually beforehand (`ssh-copy-id`, or write it to `~admin/.ssh/authorized_keys` with `0600` permissions and a `0700` `.ssh` directory).
+You can also reuse a key that already works for another account (for example root's) — only the public part is copied:
+
+```bash
+sudo bash ./bootstrap.sh --ssh-key-file /root/.ssh/authorized_keys
+```
+
+or add the key manually beforehand (`ssh-copy-id`, or write it to `~admin/.ssh/authorized_keys` with `0600` permissions and a `0700` `.ssh` directory). The private key always stays on your local machine; you log in with `ssh -i ~/.ssh/id_ed25519 admin@server`.
 
 ## Requirements
 
@@ -140,7 +146,9 @@ This does not install Docker. It creates a Podman compatibility wrapper for Comp
 | `[x] Unsupported distribution: ...` | Only Debian/Ubuntu are supported | Run on Debian 11+/12+ or Ubuntu 20.04+ |
 | `[x] Unknown option: ...` | Typo in a flag | Check `bash ./bootstrap.sh --help` |
 | `[x] Invalid username` / `Invalid SSH_PORT` | Name longer than 32 chars or with invalid characters; port outside 1–65535 | Use `[a-z_][a-z0-9_-]*` names and a valid port |
-| `[x] Aborting before enabling SSH/UFW ... Add a key first` | The admin user has no key in `~/.ssh/authorized_keys` | Re-run with `--ssh-key-file ~/.ssh/id_ed25519.pub`, or add the key manually first. This validator is intentional — it prevents lockouts |
+| `[x] Aborting before enabling SSH/UFW ... Add a key first` | The admin user has no key in `~/.ssh/authorized_keys` | Re-run with `--ssh-key-file ~/.ssh/id_ed25519.pub` (or `--ssh-key-file /root/.ssh/authorized_keys` to reuse root's key), or add the key manually first. This validator is intentional — it prevents lockouts |
+| Can I reuse the SSH key root already has? | Yes. The public key is meant to be shared | `sudo bash ./bootstrap.sh --ssh-key-file /root/.ssh/authorized_keys`, or manually: `install -d -m 0700 -o admin -g admin ~admin/.ssh && cp /root/.ssh/authorized_keys ~admin/.ssh/authorized_keys && chown admin:admin ~admin/.ssh/authorized_keys && chmod 0600 ~admin/.ssh/authorized_keys` |
+| How do I create a new SSH key? | You need a key pair on your local machine | On your local machine: `ssh-keygen -t ed25519`, then `scp ~/.ssh/id_ed25519.pub root@server:/tmp/` and re-run with `--ssh-key-file /tmp/id_ed25519.pub`. The `.pub` file is public and safe to copy; the private key never leaves your machine |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
 | Environment variables seem ignored | `sudo` strips exported variables (`env_reset`) | Use the `sudo VAR=value bash ./bootstrap.sh` form, or pass CLI arguments |

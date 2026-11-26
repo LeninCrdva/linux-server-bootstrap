@@ -17,8 +17,9 @@ Options:
   --no-docker-compat       Disable the wrapper explicitly
   --install-packages       Install OS packages with apt       (default: on)
   --no-install-packages    Skip apt; required tools must already exist
-  --ssh-key-file PATH      Install this SSH public key for the admin user
-                           before enabling SSH access
+  --ssh-key-file PATH      Install SSH public key(s) for the admin user before
+                           enabling SSH access (a .pub file or an existing
+                           authorized_keys file, e.g. /root/.ssh/authorized_keys)
   --env-file PATH          Load extra configuration from a .env-style file
                            (default: ./.env when present)
   --print-config           Print the resolved configuration and exit
@@ -251,19 +252,29 @@ has_authorized_key() {
 }
 
 install_authorized_key() {
-  local user=$1 keyfile=$2 home line
+  local user=$1 keyfile=$2 home line found=0 added=0
   home=$(user_home "$user")
   [[ -r $keyfile ]] || die "Cannot read SSH public key file: $keyfile"
-  line=$(tr -d '\r\n' < "$keyfile" | tr -s '[:space:]' ' ')
-  [[ $line =~ $SSH_KEY_RE ]] || die "File does not contain an SSH public key: $keyfile"
   install -d -m 0700 -o "$user" -g "$user" "$home/.ssh"
   touch "$home/.ssh/authorized_keys"
-  if ! grep -qxF "$line" "$home/.ssh/authorized_keys"; then
-    printf '%s\n' "$line" >> "$home/.ssh/authorized_keys"
-    log "Installed SSH public key from $keyfile for '$user'"
-  fi
+  # Accepts both a single .pub file and a full authorized_keys file:
+  # comments, blank lines and invalid lines are skipped.
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    line=$(printf '%s' "$line" | tr -s '[:space:]' ' ')
+    [[ $line =~ $SSH_KEY_RE ]] || continue
+    found=1
+    if ! grep -qxF "$line" "$home/.ssh/authorized_keys"; then
+      printf '%s\n' "$line" >> "$home/.ssh/authorized_keys"
+      added=1
+    fi
+  done < "$keyfile"
+  (( found )) || die "No valid SSH public key found in: $keyfile"
   chown "$user:$user" "$home/.ssh/authorized_keys"
   chmod 0600 "$home/.ssh/authorized_keys"
+  (( added )) && log "Installed SSH public key(s) from $keyfile for '$user'"
 }
 
 fix_ssh_perms() {
@@ -274,14 +285,14 @@ fix_ssh_perms() {
 }
 
 if [[ -n $SSH_KEY_FILE ]]; then
-  log "Seeding SSH key for '$ADMIN_USER' from $SSH_KEY_FILE"
+  log "Seeding SSH public key(s) for '$ADMIN_USER' from $SSH_KEY_FILE"
   install_authorized_key "$ADMIN_USER" "$SSH_KEY_FILE"
 fi
 
 log 'Validating SSH access before opening the firewall'
 if ! has_authorized_key "$ADMIN_USER"; then
   warn "No SSH public key found for '$ADMIN_USER' in $(user_home "$ADMIN_USER")/.ssh/authorized_keys"
-  die "Aborting before enabling SSH/UFW to avoid locking out the server. Add a key first (ssh-copy-id $ADMIN_USER@host, manually, or re-run with --ssh-key-file ~/.ssh/id_ed25519.pub), then run this script again."
+  die "Aborting before enabling SSH/UFW to avoid locking out the server. Add a key first (ssh-copy-id $ADMIN_USER@host, copy one manually, or re-run with --ssh-key-file <pubkey-file-or-authorized_keys>, e.g. /root/.ssh/authorized_keys), then run this script again."
 fi
 log "SSH public key present for '$ADMIN_USER'"
 fix_ssh_perms "$ADMIN_USER"
