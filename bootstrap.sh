@@ -290,19 +290,26 @@ create_rootless_user() {
   if id "$ROOTLESS_USER" >/dev/null 2>&1; then
     warn "User $ROOTLESS_USER already exists; leaving account settings unchanged"
   else
+    local args=()
     if [[ -n $ROOTLESS_UID ]]; then
       local by_uid
       by_uid=$(getent passwd "$ROOTLESS_UID" | cut -d: -f1 || true)
       [[ -z $by_uid ]] || die "UID $ROOTLESS_UID is already used by '$by_uid'. If that is the admin user of this same run, delete the conflicting account first (see README) or pick another UID."
+      args+=(-u "$ROOTLESS_UID")
     fi
     if [[ -n $ROOTLESS_GID ]]; then
       local by_gid
       by_gid=$(getent group "$ROOTLESS_GID" | cut -d: -f1 || true)
-      [[ -z $by_gid ]] || die "GID $ROOTLESS_GID is already used by group '$by_gid'"
+      [[ -z $by_gid ]] || die "GID $ROOTLESS_GID is already used by group '$by_gid'. Pick another GID or delete the conflicting group."
+      # useradd -g requires the group to exist, so create the user's primary
+      # group with the requested GID first (unless a group with that name exists).
+      if getent group "$ROOTLESS_USER" >/dev/null 2>&1; then
+        args+=(-g "$ROOTLESS_USER")
+      else
+        groupadd -g "$ROOTLESS_GID" "$ROOTLESS_USER"
+        args+=(-g "$ROOTLESS_GID")
+      fi
     fi
-    local args=()
-    if [[ -n $ROOTLESS_UID ]]; then args+=(-u "$ROOTLESS_UID"); fi
-    if [[ -n $ROOTLESS_GID ]]; then args+=(-g "$ROOTLESS_GID"); fi
     useradd --create-home --shell /bin/bash ${args[@]+"${args[@]}"} "$ROOTLESS_USER"
   fi
   # UIDs/GIDs of an existing user are not changed in place; warn if they differ.

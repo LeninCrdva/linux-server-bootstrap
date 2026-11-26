@@ -82,7 +82,7 @@ Inspect the resolved configuration without changing anything:
 | `--admin-user NAME` | `ADMIN_USER` | `admin` | User with passwordless sudo |
 | `--rootless-user NAME` | `ROOTLESS_USER` | `app` | Rootless Podman user without sudo |
 | `--rootless-uid UID` | `ROOTLESS_UID` | _(auto)_ | UID for the rootless user — set it to match `user:` in your compose files (e.g. `user: "1000:1000"`). When set, the rootless user is created **first** so it claims this UID; the admin user takes the next free one |
-| `--rootless-gid GID` | `ROOTLESS_GID` | _(auto)_ | Primary GID for the rootless user (usually the same as the UID) |
+| `--rootless-gid GID` | `ROOTLESS_GID` | _(auto)_ | Primary GID for the rootless user (usually the same as the UID). The group is created automatically with that GID |
 | `--ssh-port PORT` | `SSH_PORT` | `22` | Port allowed through UFW and used by sshd |
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
@@ -259,6 +259,7 @@ Caveats:
 | Compose says `user: "1000:1000"` but files end up owned by 1001 | The rootless user was auto-assigned UID 1001 | Recreate it with a fixed UID: delete the user (see *Deleting the users created by the script*) and re-run with `--rootless-uid 1000 --rootless-gid 1000` |
 | `[x] UID 1000 is already used by 'blueskyad'` | The admin user was created first and auto-took UID 1000 (or another pre-existing account owns it) | On a fresh run with `--rootless-uid`, the rootless user is created first and claims the UID. If the admin already exists with that UID, delete both users (see *Deleting the users created by the script*) and re-run, or choose a free UID (`getent passwd 1000`) |
 | User exists but with the wrong UID — the script only warns | UIDs of existing users are never changed in place | `userdel --remove --force <user>`, then re-run with `--rootless-uid` (full cleanup commands in the README) |
+| `useradd: group '1000' does not exist` | `-g 1000` needs the group to exist; it was removed with the old user | Fixed: the script now runs `groupadd -g <GID> <user>` before `useradd`. On an older run you can do it manually: `sudo groupadd -g 1000 bluesky` |
 | Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
