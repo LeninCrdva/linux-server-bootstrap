@@ -311,12 +311,17 @@ if [[ "$INSTALL_PACKAGES" == true ]]; then
   # missing on minimal cloud images, and the script uses both.
   base_packages=(
     ca-certificates curl openssh-server ufw uidmap slirp4netns fuse-overlayfs
-    libpam-systemd dbus-user-session containers-common procps iproute2
+    libpam-systemd dbus-user-session procps iproute2
   )
   if [[ $INSTALL_SUDO == true ]]; then
     base_packages+=(sudo)
   fi
   apt-get install -y --no-install-recommends "${base_packages[@]}"
+
+  # containers-common ships the default registries.conf, but the script writes
+  # its own drop-in below, so treat it as optional (not packaged on every release).
+  apt-get install -y --no-install-recommends containers-common 2>/dev/null || \
+    log 'containers-common is not available on this release; the registries drop-in below still covers short image names'
 
   log 'Installing Podman'
   apt-get install -y --no-install-recommends podman
