@@ -83,9 +83,17 @@ has_docker_search() {
   grep -rqs '^[[:space:]]*unqualified-search-registries.*docker\.io' "$@" 2>/dev/null
 }
 
+# On Debian/Ubuntu the netavark binary is not in PATH (/usr/libexec/podman/...).
+netavark_installed() {
+  command -v netavark >/dev/null 2>&1 && return 0
+  [[ -x /usr/libexec/podman/netavark || -x /usr/lib/podman/netavark ]] && return 0
+  dpkg -s netavark >/dev/null 2>&1
+}
+
 if [[ -n $DO_PORT ]]; then
   [[ "$PORT_START" =~ ^[0-9]+$ ]] && (( 0 <= 10#$PORT_START && 10#$PORT_START <= 65535 )) \
     || die "Invalid port start: $PORT_START (0-65535)"
+  command -v sysctl >/dev/null 2>&1 || die 'procps (sysctl) is not installed: apt-get install -y procps'
   log "Setting net.ipv4.ip_unprivileged_port_start=$PORT_START"
   sysctl -w "net.ipv4.ip_unprivileged_port_start=$PORT_START" >/dev/null
   printf 'net.ipv4.ip_unprivileged_port_start=%s\n' "$PORT_START" > /etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf
@@ -151,7 +159,7 @@ EOF
 fi
 
 if [[ $DO_NETAVARK == true ]]; then
-  if command -v netavark >/dev/null 2>&1; then
+  if netavark_installed; then
     log 'Setting netavark as the Podman network backend'
     install -d -m 0755 /etc/containers/containers.conf.d
     printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf

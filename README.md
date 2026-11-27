@@ -19,7 +19,13 @@ A configurable bootstrap script for Debian/Ubuntu servers. It installs and enabl
 sudo bash ./bootstrap.sh --ssh-key-file ~/.ssh/id_ed25519.pub
 ```
 
-(`chmod +x bootstrap.sh` also works if you prefer `sudo ./bootstrap.sh`.)
+Already root — typical on minimal cloud images, where `sudo` may not even be installed yet? Then no `sudo` needed at all:
+
+```bash
+bash ./bootstrap.sh --ssh-key-file /root/.ssh/id_ed25519.pub
+```
+
+The scripts never invoke `sudo` internally; they only require root. The `sudo` **package** is installed (unless `--no-sudo`) because the admin user needs it for its passwordless sudo.
 
 Keep the current SSH session open while the script runs.
 
@@ -86,6 +92,7 @@ Inspect the resolved configuration without changing anything:
 | `--unprivileged-port-start N` | `UNPRIVILEGED_PORT_START` | `80` | Sets `net.ipv4.ip_unprivileged_port_start=N` (live + persisted in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf`) so the rootless user can publish ports 80/443 |
 | `--ssh-port PORT` | `SSH_PORT` | `22` | Port **sshd listens on** (via `/etc/ssh/sshd_config.d/50-bootstrap-port.conf`, validated with `sshd -t` before reloading) **and** allowed through UFW — the two can never diverge |
 | `--ufw-reset` | `UFW_RESET` | `false` | Wipe existing UFW rules and re-apply only SSH. By default, if UFW is already active with rules, they are **kept** and only the SSH rule is ensured |
+| `--sudo` / `--no-sudo` | `INSTALL_SUDO` | `true` | Install the `sudo` package and write the admin's `NOPASSWD` sudoers rule. With `--no-sudo` neither happens (an existing rule from a previous run is removed) — useful on minimal images where you don't want sudo at all |
 | `--docker-compat` / `--no-docker-compat` | `ENABLE_DOCKER_COMPAT` | `false` | Enable the Docker-compatible wrapper and Podman socket |
 | `--install-packages` / `--no-install-packages` | `INSTALL_PACKAGES` | `true` | Install OS packages with apt |
 | `--ssh-key-file PATH` | `SSH_KEY_FILE` | _(empty)_ | Public key(s) installed for the admin user before SSH is enabled; accepts a `.pub` file or an existing `authorized_keys` file (e.g. `/root/.ssh/authorized_keys`) |
@@ -130,8 +137,12 @@ In that case the script installs the key for the rootless user and replaces the 
 
 ## Requirements
 
-- Debian or Ubuntu
-- Run as root (`sudo ./bootstrap.sh`)
+- Debian or Ubuntu — works on **minimal cloud images** (docs/locales stripped, no firewall, APT recommends disabled) and on systems with essentials already installed:
+  - everything needed is installed with `--no-install-recommends`, including `procps` (sysctl) and `iproute2` (ss), which minimal images often lack;
+  - re-runs on an already-configured server are idempotent: existing UFW rules are kept (unless `--ufw-reset`), existing users are not recreated;
+  - with `--no-install-packages` the script verifies each required tool and tells you exactly what is missing;
+  - `netavark`/`aardvark-dns` live in Ubuntu's `universe` pocket — enable it if apt can't locate them: `sudo add-apt-repository universe`.
+- Run as root — `bash ./bootstrap.sh` if you are already root (minimal images), `sudo bash ./bootstrap.sh` otherwise. The scripts never call `sudo` themselves.
 - Outbound Internet access (unless `--no-install-packages` is used)
 - An SSH key configured for the admin user (or `--ssh-key-file`) — otherwise the script refuses to enable SSH/UFW
 
@@ -297,13 +308,15 @@ Caveats:
 | `WARN ... cgroupv2 manager is set to systemd but there is no systemd user session ... Falling back to --cgroup-manager=cgroupfs` | The rootless user has no systemd user manager (`user@UID.service`) running yet, so Podman cannot use the systemd cgroup manager | Benign — Podman falls back to cgroupfs and works. The script enables linger and tries `systemctl start user@<uid>`; if it still warns, run `sudo systemctl start user@1000` (or log in once as that user / reboot) and check `systemctl is-active user@1000`. In containers without systemd as PID 1 the user manager never starts — set `cgroup_manager = "cgroupfs"` in `~/.config/containers/containers.conf` |
 | `[!] User systemd manager for '...' is not running yet` (from the bootstrap) | Same cause, reported by the script right after enabling linger | Same fix: `sudo systemctl start user@1000` or first login/boot of the user. Safe to ignore — only Podman's cgroup backend is affected until then |
 | `user@1000.service` fails: `PAM unable to dlopen(pam_systemd.so)` / `$XDG_RUNTIME_DIR is not set` / `Error: 49 (Protocol driver not attached)` | `libpam-systemd` (and usually `dbus-user-session`) not installed — common in slim/container images. Without pam_systemd, logind cannot open the user session, so no `/run/user/1000` and the user manager exits 1 | `sudo apt-get install -y libpam-systemd dbus-user-session && sudo systemctl start user@1000` (the script now installs these packages itself). Verify: `systemctl is-active user@1000` → `active` |
+| `E: Unable to locate package netavark` / `aardvark-dns` on a minimal Ubuntu image | Those packages live in the `universe` pocket, which minimal images sometimes have disabled | `sudo add-apt-repository universe && sudo apt-get update && sudo apt-get install -y netavark aardvark-dns` (pasta is optional — not packaged on every release) |
 | `Error: short-name "dunglas/frankenphp:..." did not resolve to an alias and no unqualified-search registries are defined in "/etc/containers/registries.conf"` (build/run fails with exit 125) | Installed with `--no-install-recommends`, so `containers-common`'s default `unqualified-search-registries` is missing — and/or the user-level `~/.config/containers/registries.conf` exists without docker.io, which takes precedence over the system file | Fixed: the script installs `containers-common` and writes `unqualified-search-registries = ["docker.io"]` both to `/etc/containers/registries.conf.d/00-unqualified-search.conf` and to `~<rootless>/.config/containers/registries.conf.d/00-unqualified-search.conf`. Manually: `echo 'unqualified-search-registries = ["docker.io"]' > ~/.config/containers/registries.conf.d/00-unqualified-search.conf` (as the rootless user), or use fully-qualified image names (`docker.io/dunglas/frankenphp:...`). Verify: `podman info | grep -A3 registries` |
 | `Error: rootlessport cannot expose privileged port 80 ... bind: permission denied` | Rootless containers cannot bind ports < `net.ipv4.ip_unprivileged_port_start` (default 1024) | Fixed: the script sets it to 80 by default (`--unprivileged-port-start`, persisted in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf`). Manually: `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80` + persist it, or publish on ports >= 1024, or use `sudo bash scripts/extras.sh --unprivileged-port-start 80` |
 | I ran with `--ssh-port 2222` but SSH still answers on 22 / I got locked out | `SSH_PORT` used to only open the UFW rule; sshd kept listening on 22 | Fixed: the script now writes `Port 2222` to `/etc/ssh/sshd_config.d/50-bootstrap-port.conf`, validates with `sshd -t` and reloads sshd **before** enabling UFW, so sshd and the firewall always use the same port. Verify: `ss -tlnp | grep sshd` |
 | `sudo` asks for a password (or fails) for the admin user | The sudoers rule used `ALL` instead of `NOPASSWD: ALL`, and `useradd` leaves the password locked so sudo could never authenticate | Fixed: the rule is now `<admin> ALL=(ALL:ALL) NOPASSWD: ALL` (validated with `visudo -cf`), matching the documented passwordless sudo |
+| I don't want sudo installed at all (minimal image) | The script installs `sudo` by default because the admin user needs it | Re-run with `--no-sudo` (or `INSTALL_SUDO=false`): the package is not installed, no sudoers rule is written (and a previous one is removed), and the summary shows the admin without sudo. The admin then just logs in directly without sudo |
 | Re-running the script wiped my UFW rules / blocked my services | The old script always ran `ufw --force reset` | Fixed: when UFW is already active with rules, they are kept and only the SSH rule is ensured; a full reset now requires `--ufw-reset` explicitly |
 | Container can't create files in the bind-mounted project dir (permission denied) | The image sets `USER 1000`, so in rootless Podman container UID 1000 maps to a host subuid (100999), not to your host UID 1000 | Add `userns_mode: keep-id` to the compose service (container UID 1000 → host UID 1000), or drop the non-zero `USER` (container UID 0 → your host UID automatically). Repair existing files: `sudo bash scripts/extras.sh --project-dir <dir> --rootless-user bluesky` |
-| Container names don't resolve (DNS errors between containers) | Podman is using the legacy CNI backend (default on older releases like Ubuntu 22.04), whose dnsname support is limited | The script installs `netavark aardvark-dns` (and `pasta` when packaged) and writes `/etc/containers/containers.conf.d/10-netavark.conf` with `network_backend = "netavark"`, validating it with `podman info`. Manually: `sudo apt-get install -y netavark aardvark-dns && sudo bash scripts/extras.sh --netavark` — then recreate the network (`podman compose down && up`). Note: `pasta` is not packaged on every release (e.g. Ubuntu 22.04) — there rootless uses `rootlessport` instead. If podman is too old to know `network_backend`, the script removes the drop-in and stays on CNI; upgrade podman from backports |
+| Container names don't resolve (DNS errors between containers) | Podman is using the legacy CNI backend (default on older releases like Ubuntu 22.04), whose dnsname support is limited | The script installs `netavark aardvark-dns` (and `pasta` when packaged) and writes `/etc/containers/containers.conf.d/10-netavark.conf` with `network_backend = "netavark"`, validating it with `podman info`. (Detection also checks `/usr/libexec/podman/netavark`, since the binary is not in PATH on Debian/Ubuntu.) Manually: `sudo apt-get install -y netavark aardvark-dns && sudo bash scripts/extras.sh --netavark` — then recreate the network (`podman compose down && up`). Note: `pasta` is not packaged on every release (e.g. Ubuntu 22.04) — there rootless uses `rootlessport` instead. If podman is too old to know `network_backend`, the script removes the drop-in and stays on CNI; upgrade podman from backports |
 | Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |
