@@ -297,6 +297,10 @@ if [[ "$INSTALL_PACKAGES" == true ]]; then
 
   log 'Installing podman-compose'
   apt-get install -y --no-install-recommends podman-compose
+
+  log 'Installing netavark + aardvark-dns + pasta (network backend with working container-name DNS)'
+  apt-get install -y --no-install-recommends netavark aardvark-dns pasta || \
+    warn 'netavark/aardvark-dns/pasta are unavailable on this release; keeping the default network backend (CNI on older releases)'
 fi
 
 command -v ufw >/dev/null || die 'UFW is not installed'
@@ -315,6 +319,16 @@ if ! has_docker_search /etc/containers/registries.conf /etc/containers/registrie
   log 'Set unqualified-search-registries=["docker.io"] in /etc/containers/registries.conf.d/00-unqualified-search.conf'
 else
   log 'docker.io already in system unqualified-search-registries'
+fi
+
+# netavark resolves container names via aardvark-dns; the legacy CNI backend
+# (default on older releases) does not without extra plugins.
+if command -v netavark >/dev/null 2>&1; then
+  log 'Setting netavark as the Podman network backend'
+  install -d -m 0755 /etc/containers/containers.conf.d
+  printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf
+else
+  warn 'netavark is not installed; container-name DNS may not resolve with the CNI backend. Install netavark aardvark-dns pasta and set network_backend="netavark" in /etc/containers/containers.conf.d/ (or run scripts/extras.sh --netavark)'
 fi
 
 # --- Users --------------------------------------------------------------------
