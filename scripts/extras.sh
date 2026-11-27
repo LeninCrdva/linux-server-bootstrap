@@ -22,6 +22,13 @@ Options:
   --registries                  Ensure docker.io is in unqualified-search-registries
                                 (system-wide and for the rootless user), so short
                                 image names like dunglas/frankenphp resolve
+  --project-dir PATH            Fix ownership/permissions of a compose project
+                                dir for the rootless user (chown -R, setgid dirs,
+                                group rwX) — repairs files already created with
+                                wrong mapped UIDs
+  --netavark                    Set netavark as the Podman network backend
+                                (/etc/containers/containers.conf.d/10-netavark.conf);
+                                fixes container-name DNS (needs netavark installed)
   --all                         All of the above (port start 80)
   -h, --help                    Show this help
 
@@ -29,6 +36,12 @@ Examples:
   sudo bash scripts/extras.sh --all
   sudo bash scripts/extras.sh --unprivileged-port-start 80 --registries
   sudo bash scripts/extras.sh --docker-compat --rootless-user bluesky
+  sudo bash scripts/extras.sh --project-dir /home/bluesky/sri-proyecto --rootless-user bluesky
+
+Rootless UID mapping reminder: inside a rootless container, UID 0 maps to the
+host user's UID, and UID N (N>0) maps to the subordinate range (100000+N-1).
+If your image sets USER 1000, add 'userns_mode: keep-id' to the compose
+service so container UID 1000 maps to host UID 1000 and bind mounts work.
 EOF
 }
 
@@ -37,6 +50,8 @@ DO_PORT=''
 PORT_START=''
 DO_DOCKER=false
 DO_REGISTRIES=false
+DO_NETAVARK=false
+PROJECT_DIR=''
 
 need_value() { [[ -n ${2:-} ]] || die "Option $1 requires a value"; }
 
@@ -48,15 +63,18 @@ while [[ $# -gt 0 ]]; do
     --unprivileged-port-start=*)  DO_PORT=1; PORT_START=${1#*=}; shift ;;
     --docker-compat)              DO_DOCKER=true; shift ;;
     --registries)                 DO_REGISTRIES=true; shift ;;
-    --all)                        DO_PORT=1; PORT_START=80; DO_DOCKER=true; DO_REGISTRIES=true; shift ;;
+    --project-dir)                need_value "$1" "${2:-}"; PROJECT_DIR=${2:-}; shift 2 ;;
+    --project-dir=*)              PROJECT_DIR=${1#*=}; shift ;;
+    --netavark)                   DO_NETAVARK=true; shift ;;
+    --all)                        DO_PORT=1; PORT_START=80; DO_DOCKER=true; DO_REGISTRIES=true; DO_NETAVARK=true; shift ;;
     -h|--help)                    usage; exit 0 ;;
     *)                            die "Unknown option: $1 (try --help)" ;;
   esac
 done
 
-if [[ -z $DO_PORT && $DO_DOCKER == false && $DO_REGISTRIES == false ]]; then
+if [[ -z $DO_PORT && $DO_DOCKER == false && $DO_REGISTRIES == false && $DO_NETAVARK == false && -z $PROJECT_DIR ]]; then
   usage >&2
-  die 'Nothing to do: pass --unprivileged-port-start, --docker-compat, --registries or --all'
+  die 'Nothing to do: pass --unprivileged-port-start, --docker-compat, --registries, --project-dir, --netavark or --all'
 fi
 
 [[ $EUID -eq 0 ]] || die 'Run as root, e.g.: sudo bash scripts/extras.sh --all'
@@ -130,6 +148,27 @@ EOF
   runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$rdir" DBUS_SESSION_BUS_ADDRESS="unix:path=$rdir/bus" \
     systemctl --user enable --now podman.socket 2>/dev/null || \
     warn "podman.socket not enabled (user manager not running?). Start it with: systemctl start user@$uid.service, or log in once as $ROOTLESS_USER"
+fi
+
+if [[ $DO_NETAVARK == true ]]; then
+  if command -v netavark >/dev/null 2>&1; then
+    log 'Setting netavark as the Podman network backend'
+    install -d -m 0755 /etc/containers/containers.conf.d
+    printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf
+    log 'Wrote /etc/containers/containers.conf.d/10-netavark.conf'
+  else
+    warn 'netavark is not installed; install it first: apt-get install -y netavark aardvark-dns pasta'
+  fi
+fi
+
+if [[ -n $PROJECT_DIR ]]; then
+  id "$ROOTLESS_USER" >/dev/null 2>&1 || die "User $ROOTLESS_USER does not exist"
+  [[ -d $PROJECT_DIR ]] || die "Not a directory: $PROJECT_DIR"
+  log "Fixing ownership/permissions of $PROJECT_DIR for '$ROOTLESS_USER'"
+  chown -R "$ROOTLESS_USER:$ROOTLESS_USER" "$PROJECT_DIR"
+  chmod -R u+rwX,g+rwX "$PROJECT_DIR"
+  find "$PROJECT_DIR" -type d -exec chmod g+s {} +
+  log "Done. If the image sets USER to a non-zero UID, also add 'userns_mode: keep-id' to that compose service so container UID 1000 maps to host UID 1000"
 fi
 
 log 'Extras applied'

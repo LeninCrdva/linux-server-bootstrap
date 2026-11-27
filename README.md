@@ -211,7 +211,19 @@ sudo bash scripts/extras.sh --docker-compat --rootless-user bluesky # docker com
 | `--unprivileged-port-start N` | `sysctl -w net.ipv4.ip_unprivileged_port_start=N` + persists in `/etc/sysctl.d/99-bootstrap-unprivileged-port-start.conf` |
 | `--registries` | Writes `unqualified-search-registries = ["docker.io"]` to `/etc/containers/registries.conf.d/00-unqualified-search.conf` and `~<rootless>/.config/containers/registries.conf.d/00-unqualified-search.conf` if missing |
 | `--docker-compat` | Installs the `docker compose` → `podman compose` wrapper at `/usr/local/bin/docker`, enables linger and the rootless `podman.socket` |
+| `--project-dir PATH` | Repairs a compose project dir for the rootless user: `chown -R`, group `rwX`, setgid on dirs — fixes files already created with wrong mapped UIDs |
+| `--netavark` | Writes `/etc/containers/containers.conf.d/10-netavark.conf` with `network_backend = "netavark"` (needs `netavark` installed) — fixes container-name DNS resolution |
 | `--all` | All of the above with port start 80 |
+
+The main script also installs `netavark` + `aardvark-dns` + `pasta` (best effort) and sets the netavark backend automatically when available.
+
+### Rootless UID mapping and bind-mount permissions
+
+In rootless Podman the mapping is: container **UID 0 → your host UID** (e.g. 1000), and container **UID N (N>0) → host subuid 100000+N-1**. So if the image sets `USER 1000` (your build args), files in bind mounts end up owned by a subuid (100999) and the host user cannot write them. Fixes, in order of preference:
+
+1. Add `userns_mode: keep-id` to the compose service — container UID 1000 then maps to host UID 1000.
+2. Or don't set a non-zero `USER` in the image — container root maps to your host UID automatically (still rootless/safe).
+3. Repair existing files: `sudo bash scripts/extras.sh --project-dir /home/bluesky/sri-proyecto --rootless-user bluesky`
 
 The same settings are also available in the main script via `--unprivileged-port-start` and `--docker-compat`.
 
@@ -290,6 +302,8 @@ Caveats:
 | I ran with `--ssh-port 2222` but SSH still answers on 22 / I got locked out | `SSH_PORT` used to only open the UFW rule; sshd kept listening on 22 | Fixed: the script now writes `Port 2222` to `/etc/ssh/sshd_config.d/50-bootstrap-port.conf`, validates with `sshd -t` and reloads sshd **before** enabling UFW, so sshd and the firewall always use the same port. Verify: `ss -tlnp | grep sshd` |
 | `sudo` asks for a password (or fails) for the admin user | The sudoers rule used `ALL` instead of `NOPASSWD: ALL`, and `useradd` leaves the password locked so sudo could never authenticate | Fixed: the rule is now `<admin> ALL=(ALL:ALL) NOPASSWD: ALL` (validated with `visudo -cf`), matching the documented passwordless sudo |
 | Re-running the script wiped my UFW rules / blocked my services | The old script always ran `ufw --force reset` | Fixed: when UFW is already active with rules, they are kept and only the SSH rule is ensured; a full reset now requires `--ufw-reset` explicitly |
+| Container can't create files in the bind-mounted project dir (permission denied) | The image sets `USER 1000`, so in rootless Podman container UID 1000 maps to a host subuid (100999), not to your host UID 1000 | Add `userns_mode: keep-id` to the compose service (container UID 1000 → host UID 1000), or drop the non-zero `USER` (container UID 0 → your host UID automatically). Repair existing files: `sudo bash scripts/extras.sh --project-dir <dir> --rootless-user bluesky` |
+| Container names don't resolve (DNS errors between containers) | Podman is using the legacy CNI backend (default on older releases like Ubuntu 22.04), whose dnsname support is limited | The script installs `netavark aardvark-dns pasta` and writes `/etc/containers/containers.conf.d/10-netavark.conf` with `network_backend = "netavark"`. Manually: `sudo apt-get install -y netavark aardvark-dns pasta && sudo bash scripts/extras.sh --netavark` — then recreate the network (`podman network rm <net>` / `podman compose down && up`) |
 | Is it wrong to give the rootless user SSH? | Not wrong, but it must be deliberate and hardened | Least privilege says no SSH for service accounts; if needed, use a dedicated key + the `Match User` restrictions the script applies automatically |
 | `[x] openssh-server is not installed` | You ran with `--no-install-packages` without sshd | Install `openssh-server` or drop the flag |
 | `[x] UFW is not installed` / `Podman is not installed` | Same, missing packages | Install `ufw podman podman-compose` or run without `--no-install-packages` |

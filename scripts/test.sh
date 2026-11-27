@@ -117,7 +117,7 @@ printf 'UFW_RESET defaults to false, is settable and validated.\n'
 
 # extras.sh: help and argument validation work without root changes
 extras_help=$(bash "$script_dir/extras.sh" --help)
-for opt in --unprivileged-port-start --docker-compat --registries --all; do
+for opt in --unprivileged-port-start --docker-compat --registries --project-dir --netavark --all; do
   [[ $extras_help == *"$opt"* ]] || fail "extras.sh --help is missing $opt"
 done
 if bash "$script_dir/extras.sh" --bogus-option >/dev/null 2>&1; then
