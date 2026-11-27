@@ -298,9 +298,13 @@ if [[ "$INSTALL_PACKAGES" == true ]]; then
   log 'Installing podman-compose'
   apt-get install -y --no-install-recommends podman-compose
 
-  log 'Installing netavark + aardvark-dns + pasta (network backend with working container-name DNS)'
-  apt-get install -y --no-install-recommends netavark aardvark-dns pasta || \
-    warn 'netavark/aardvark-dns/pasta are unavailable on this release; keeping the default network backend (CNI on older releases)'
+  log 'Installing netavark + aardvark-dns (network backend with working container-name DNS)'
+  apt-get install -y --no-install-recommends netavark aardvark-dns || \
+    warn 'netavark/aardvark-dns are unavailable on this release; keeping the default network backend (CNI on older releases)'
+  # pasta is the rootless netavark datapath on newer releases; older ones use
+  # rootlessport (bundled with podman), and some releases don't package pasta.
+  apt-get install -y --no-install-recommends pasta 2>/dev/null || \
+    log 'pasta is not packaged on this release; rootless netavark will use rootlessport instead'
 fi
 
 command -v ufw >/dev/null || die 'UFW is not installed'
@@ -327,8 +331,14 @@ if command -v netavark >/dev/null 2>&1; then
   log 'Setting netavark as the Podman network backend'
   install -d -m 0755 /etc/containers/containers.conf.d
   printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf
+  if podman info >/dev/null 2>&1; then
+    log 'netavark is now the network backend (verified with podman info)'
+  else
+    rm -f /etc/containers/containers.conf.d/10-netavark.conf
+    warn 'this podman version rejected network_backend=netavark; drop-in removed and staying on the default backend. Upgrade podman (e.g. from backports) to use netavark.'
+  fi
 else
-  warn 'netavark is not installed; container-name DNS may not resolve with the CNI backend. Install netavark aardvark-dns pasta and set network_backend="netavark" in /etc/containers/containers.conf.d/ (or run scripts/extras.sh --netavark)'
+  warn 'netavark is not installed; container-name DNS may not resolve with the CNI backend. Install: apt-get install -y netavark aardvark-dns  then set network_backend="netavark" in /etc/containers/containers.conf.d/ (or run scripts/extras.sh --netavark)'
 fi
 
 # --- Users --------------------------------------------------------------------

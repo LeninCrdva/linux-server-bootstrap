@@ -155,9 +155,14 @@ if [[ $DO_NETAVARK == true ]]; then
     log 'Setting netavark as the Podman network backend'
     install -d -m 0755 /etc/containers/containers.conf.d
     printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf
-    log 'Wrote /etc/containers/containers.conf.d/10-netavark.conf'
+    if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+      log 'Wrote /etc/containers/containers.conf.d/10-netavark.conf (verified with podman info)'
+    else
+      rm -f /etc/containers/containers.conf.d/10-netavark.conf
+      warn 'this podman version rejected network_backend=netavark; staying on the default backend. Upgrade podman (e.g. from backports) to use netavark.'
+    fi
   else
-    warn 'netavark is not installed; install it first: apt-get install -y netavark aardvark-dns pasta'
+    warn 'netavark is not installed; install it first: apt-get install -y netavark aardvark-dns  (pasta is optional, not packaged on every release)'
   fi
 fi
 
