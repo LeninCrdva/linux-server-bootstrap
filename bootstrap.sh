@@ -26,9 +26,17 @@ has_docker_search() {
   grep -rqs '^[[:space:]]*unqualified-search-registries.*docker\.io' "$@" 2>/dev/null
 }
 
+# True if the netavark package is installed. On Debian/Ubuntu its binary is not
+# in PATH (it lives in /usr/libexec/podman or /usr/lib/podman), so check those too.
+netavark_installed() {
+  command -v netavark >/dev/null 2>&1 && return 0
+  [[ -x /usr/libexec/podman/netavark || -x /usr/lib/podman/netavark ]] && return 0
+  dpkg -s netavark >/dev/null 2>&1
+}
+
 usage() {
   cat <<'EOF'
-Usage: sudo ./bootstrap.sh [OPTIONS]
+Usage: bash ./bootstrap.sh [OPTIONS]     (run as root; if you are not root: sudo bash ./bootstrap.sh)
 
 Options:
   --admin-user NAME        User with passwordless sudo        (default: admin)
@@ -45,6 +53,9 @@ Options:
   --ssh-port PORT          Port sshd listens on AND UFW allows (default: 22)
   --ufw-reset              Wipe existing UFW rules and re-apply only SSH
                            (default: keep existing rules when UFW is active)
+  --sudo / --no-sudo       Install sudo and give the admin passwordless sudo
+                           (default: --sudo; with --no-sudo the package is not
+                           installed and no sudoers rule is written)
   --docker-compat          Enable the `docker compose` wrapper (default: off)
   --no-docker-compat       Disable the wrapper explicitly
   --install-packages       Install OS packages with apt       (default: on)
@@ -90,6 +101,7 @@ DEF_ROOTLESS_UID=''
 DEF_ROOTLESS_GID=''
 DEF_UNPRIVILEGED_PORT_START=80
 DEF_UFW_RESET=false
+DEF_INSTALL_SUDO=true
 DEF_SSH_PORT=22
 DEF_ENABLE_DOCKER_COMPAT=false
 DEF_INSTALL_PACKAGES=true
@@ -102,6 +114,7 @@ CLI_ROOTLESS_UID=''
 CLI_ROOTLESS_GID=''
 CLI_UNPRIVILEGED_PORT_START=''
 CLI_UFW_RESET=''
+CLI_INSTALL_SUDO=''
 CLI_SSH_PORT=''
 CLI_ENABLE_DOCKER_COMPAT=''
 CLI_INSTALL_PACKAGES=''
@@ -126,6 +139,8 @@ while [[ $# -gt 0 ]]; do
     --unprivileged-port-start)    need_value "$1" "${2:-}"; CLI_UNPRIVILEGED_PORT_START=${2:-}; shift 2 ;;
     --unprivileged-port-start=*)  CLI_UNPRIVILEGED_PORT_START=${1#*=}; shift ;;
     --ufw-reset)             CLI_UFW_RESET=true; shift ;;
+    --sudo)                  CLI_INSTALL_SUDO=true; shift ;;
+    --no-sudo)               CLI_INSTALL_SUDO=false; shift ;;
     --ssh-port)              need_value "$1" "${2:-}"; CLI_SSH_PORT=${2:-}; shift 2 ;;
     --ssh-port=*)            CLI_SSH_PORT=${1#*=}; shift ;;
     --docker-compat|--enable-docker-compat) CLI_ENABLE_DOCKER_COMPAT=true; shift ;;
@@ -145,7 +160,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- .env file ----------------------------------------------------------------
-KNOWN_VARS='ADMIN_USER ROOTLESS_USER ROOTLESS_UID ROOTLESS_GID UNPRIVILEGED_PORT_START UFW_RESET SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
+KNOWN_VARS='ADMIN_USER ROOTLESS_USER ROOTLESS_UID ROOTLESS_GID UNPRIVILEGED_PORT_START UFW_RESET INSTALL_SUDO SSH_PORT ENABLE_DOCKER_COMPAT INSTALL_PACKAGES SSH_KEY_FILE ROOTLESS_SSH_KEY_FILE'
 
 # Parses KEY=VALUE lines without eval: comments (#) and blank lines are skipped,
 # optional surrounding quotes are stripped, unknown keys are ignored.
@@ -204,6 +219,7 @@ ROOTLESS_UID=$(pick ROOTLESS_UID)
 ROOTLESS_GID=$(pick ROOTLESS_GID)
 UNPRIVILEGED_PORT_START=$(pick UNPRIVILEGED_PORT_START)
 UFW_RESET=$(pick UFW_RESET)
+INSTALL_SUDO=$(pick INSTALL_SUDO)
 SSH_PORT=$(pick SSH_PORT)
 ENABLE_DOCKER_COMPAT=$(pick ENABLE_DOCKER_COMPAT)
 INSTALL_PACKAGES=$(pick INSTALL_PACKAGES)
@@ -243,6 +259,7 @@ valid_port_start() {
 }
 valid_port_start "$UNPRIVILEGED_PORT_START" || die "Invalid UNPRIVILEGED_PORT_START: $UNPRIVILEGED_PORT_START (0-65535)"
 valid_bool "$UFW_RESET" || die "UFW_RESET must be true or false (got: $UFW_RESET)"
+valid_bool "$INSTALL_SUDO" || die "INSTALL_SUDO must be true or false (got: $INSTALL_SUDO)"
 
 # The sudo (admin) key and the rootless key must never be the same: the admin
 # key grants sudo, so sharing it with the rootless/CI account would defeat the
@@ -262,6 +279,7 @@ if [[ $CLI_PRINT_CONFIG == true ]]; then
   printf 'ROOTLESS_GID=%s\n' "$ROOTLESS_GID"
   printf 'UNPRIVILEGED_PORT_START=%s\n' "$UNPRIVILEGED_PORT_START"
   printf 'UFW_RESET=%s\n' "$UFW_RESET"
+  printf 'INSTALL_SUDO=%s\n' "$INSTALL_SUDO"
   printf 'SSH_PORT=%s\n' "$SSH_PORT"
   printf 'ENABLE_DOCKER_COMPAT=%s\n' "$ENABLE_DOCKER_COMPAT"
   printf 'INSTALL_PACKAGES=%s\n' "$INSTALL_PACKAGES"
@@ -273,7 +291,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-[[ $EUID -eq 0 ]] || die 'Run this script as root (for example: sudo ./bootstrap.sh)'
+[[ $EUID -eq 0 ]] || die 'Run as root. Already root (typical on minimal cloud images, where sudo may not exist yet)? Then: bash ./bootstrap.sh   |   Non-root user? Then: sudo bash ./bootstrap.sh'
 [[ -r /etc/os-release ]] || die '/etc/os-release is unavailable'
 
 . /etc/os-release
@@ -288,9 +306,17 @@ if [[ "$INSTALL_PACKAGES" == true ]]; then
   apt-get update
 
   log 'Installing base packages'
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl openssh-server ufw sudo uidmap slirp4netns fuse-overlayfs \
-    libpam-systemd dbus-user-session containers-common
+  # --no-install-recommends also matches minimal images with APT recommends disabled.
+  # procps (sysctl) and iproute2 (ss) are present on full systems but often
+  # missing on minimal cloud images, and the script uses both.
+  base_packages=(
+    ca-certificates curl openssh-server ufw uidmap slirp4netns fuse-overlayfs
+    libpam-systemd dbus-user-session containers-common procps iproute2
+  )
+  if [[ $INSTALL_SUDO == true ]]; then
+    base_packages+=(sudo)
+  fi
+  apt-get install -y --no-install-recommends "${base_packages[@]}"
 
   log 'Installing Podman'
   apt-get install -y --no-install-recommends podman
@@ -310,6 +336,12 @@ fi
 command -v ufw >/dev/null || die 'UFW is not installed'
 command -v podman >/dev/null || die 'Podman is not installed'
 command -v sshd >/dev/null || die 'openssh-server is not installed; install it or run with INSTALL_PACKAGES=true so SSH access can be enabled safely'
+command -v systemctl >/dev/null 2>&1 || warn 'systemctl not found; this script expects systemd (standard on cloud images). Service enable/reload steps may fail on non-systemd systems.'
+# sudo is installed with INSTALL_PACKAGES=true (unless --no-sudo); on minimal
+# images without it (and --no-install-packages) just warn when sudo is wanted.
+if [[ $INSTALL_SUDO == true ]]; then
+  command -v sudo >/dev/null 2>&1 || warn 'sudo is not installed; the admin sudoers rule was written but needs the package: apt-get install -y sudo'
+fi
 # Without pam_systemd.so logind cannot open user sessions: user@UID fails with
 # "$XDG_RUNTIME_DIR is not set" and rootless Podman falls back to cgroupfs.
 [[ -e /usr/lib/security/pam_systemd.so ]] || warn 'libpam-systemd is missing (pam_systemd.so not found); user@UID will fail and rootless Podman will use cgroupfs. Install: apt-get install -y libpam-systemd dbus-user-session (or re-run with INSTALL_PACKAGES=true)'
@@ -327,7 +359,7 @@ fi
 
 # netavark resolves container names via aardvark-dns; the legacy CNI backend
 # (default on older releases) does not without extra plugins.
-if command -v netavark >/dev/null 2>&1; then
+if netavark_installed; then
   log 'Setting netavark as the Podman network backend'
   install -d -m 0755 /etc/containers/containers.conf.d
   printf '[network]\nnetwork_backend = "netavark"\n' > /etc/containers/containers.conf.d/10-netavark.conf
@@ -402,13 +434,22 @@ else
   create_rootless_user
 fi
 
-log 'Configuring passwordless sudo for the administrator'
-install -d -m 0750 /etc/sudoers.d
-cat > "/etc/sudoers.d/90-${ADMIN_USER}" <<EOF
+if [[ $INSTALL_SUDO == true ]]; then
+  log 'Configuring passwordless sudo for the administrator'
+  install -d -m 0750 /etc/sudoers.d
+  cat > "/etc/sudoers.d/90-${ADMIN_USER}" <<EOF
 ${ADMIN_USER} ALL=(ALL:ALL) NOPASSWD: ALL
 EOF
-chmod 0440 "/etc/sudoers.d/90-${ADMIN_USER}"
-visudo -cf "/etc/sudoers.d/90-${ADMIN_USER}" >/dev/null || die 'The generated sudoers file is invalid'
+  chmod 0440 "/etc/sudoers.d/90-${ADMIN_USER}"
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -cf "/etc/sudoers.d/90-${ADMIN_USER}" >/dev/null || die 'The generated sudoers file is invalid'
+  else
+    warn 'visudo not available; skipping sudoers validation (install sudo for full checks)'
+  fi
+else
+  rm -f "/etc/sudoers.d/90-${ADMIN_USER}"
+  log 'Skipping sudo setup (--no-sudo): the admin user will NOT have sudo'
+fi
 
 if id "$ROOTLESS_USER" | grep -q 'sudo\|wheel'; then
   warn "Rootless user $ROOTLESS_USER appears to belong to a privileged group"
@@ -633,5 +674,10 @@ runuser -u "$ROOTLESS_USER" -- env XDG_RUNTIME_DIR="$ROOTLESS_RUNTIME_DIR" DBUS_
   warn "Rootless Podman could not be verified from the installer session (no user runtime at $ROOTLESS_RUNTIME_DIR yet). After the first login/boot of '$ROOTLESS_USER', check with: runuser -u $ROOTLESS_USER -- podman info"
 
 log 'Configuration complete'
-printf '\nUsers:\n  sudo: %s\n  rootless: %s (uid=%s, gid=%s)\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
-  "$ADMIN_USER" "$ROOTLESS_USER" "$(id -u "$ROOTLESS_USER")" "$(id -g "$ROOTLESS_USER")" "$SSH_PORT" "$ADMIN_USER" "$ROOTLESS_SSH_DESC" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"
+if [[ $INSTALL_SUDO == true ]]; then
+  admin_line="sudo: $ADMIN_USER (NOPASSWD)"
+else
+  admin_line="admin: $ADMIN_USER (no sudo, --no-sudo)"
+fi
+printf '\nUsers:\n  %s\n  rootless: %s (uid=%s, gid=%s)\n\nSSH: enabled, port %s/tcp, key required for %s\nRootless SSH: %s\nUFW: SSH port %s/tcp allowed\nCompose: podman compose; docker compose=%s\n' \
+  "$admin_line" "$ROOTLESS_USER" "$(id -u "$ROOTLESS_USER")" "$(id -g "$ROOTLESS_USER")" "$SSH_PORT" "$ADMIN_USER" "$ROOTLESS_SSH_DESC" "$SSH_PORT" "$ENABLE_DOCKER_COMPAT"

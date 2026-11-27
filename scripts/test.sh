@@ -11,7 +11,7 @@ bash -n "$script_dir/extras.sh"
 printf 'Shell syntax is valid (bootstrap.sh and extras.sh).\n'
 
 help_out=$(bash "$bootstrap" --help)
-for opt in --admin-user --rootless-user --rootless-uid --rootless-gid --unprivileged-port-start --ssh-port --ufw-reset --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
+for opt in --admin-user --rootless-user --rootless-uid --rootless-gid --unprivileged-port-start --ssh-port --ufw-reset --no-sudo --docker-compat --ssh-key-file --rootless-ssh-key-file --env-file --print-config; do
   [[ $help_out == *"$opt"* ]] || fail "--help output is missing $opt"
 done
 printf -- '--help lists all expected options.\n'
@@ -115,6 +115,15 @@ if bash "$bootstrap" --print-config --ufw-reset=yes >/dev/null 2>&1; then
 fi
 printf 'UFW_RESET defaults to false, is settable and validated.\n'
 
+# INSTALL_SUDO defaults to true and --no-sudo disables it
+[[ $(bash "$bootstrap" --print-config) == *'INSTALL_SUDO=true'* ]] || fail 'default INSTALL_SUDO should be true'
+out=$(bash "$bootstrap" --print-config --no-sudo)
+[[ $out == *'INSTALL_SUDO=false'* ]] || fail '--no-sudo not applied'
+if bash "$bootstrap" --print-config --no-sudo=yes >/dev/null 2>&1; then
+  fail 'invalid INSTALL_SUDO value was accepted'
+fi
+printf 'INSTALL_SUDO defaults to true and --no-sudo works.\n'
+
 # extras.sh: help and argument validation work without root changes
 extras_help=$(bash "$script_dir/extras.sh" --help)
 for opt in --unprivileged-port-start --docker-compat --registries --project-dir --netavark --all; do
@@ -124,5 +133,13 @@ if bash "$script_dir/extras.sh" --bogus-option >/dev/null 2>&1; then
   fail 'extras.sh accepted an unknown option'
 fi
 printf 'extras.sh --help lists its options and rejects unknown ones.\n'
+
+# root must be able to run the scripts directly on minimal images (no sudo
+# installed yet): neither script may invoke sudo as a command (help examples ok)
+if grep -nE '^[[:space:]]*sudo[[:space:]]|[;&|][[:space:]]*sudo[[:space:]]' "$bootstrap" "$script_dir/extras.sh" \
+   | grep -vE 'bash \./bootstrap\.sh|bash scripts/extras\.sh'; then
+  fail 'a script invokes sudo internally; root should run it directly'
+fi
+printf 'Neither script invokes sudo internally (root runs them directly).\n'
 
 printf 'All tests passed.\n'
